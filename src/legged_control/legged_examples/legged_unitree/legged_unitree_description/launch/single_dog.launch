@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="robot_type" default="a1"/>
+    <arg name="ns"/>           <!-- 必填:dog1, dog2, ... -->
+    <arg name="init_x"/>       <!-- 必填:初始 X 座標 -->
+    <arg name="init_y" default="0.0"/>
+    <arg name="init_z" default="0.5"/>
+
+    <group ns="$(arg ns)">
+        <!--
+          <group ns="dog1"> 的效果:
+          - 裡面所有的 <param> 自動存到 /dog1/ 下
+          - 裡面所有的 <node> 名稱自動加上 /dog1/ 前綴
+          - 但程式碼裡面帶 "/" 的操作不受影響(這就是為什麼 C++ 也要改)
+        -->
+
+        <!-- Gazebo 的 ContactSensor 參數 -->
+        <rosparam file="$(find legged_gazebo)/config/default.yaml"
+                  command="load"/>
+
+        <!-- URDF 描述:存到 /dog1/legged_robot_description -->
+        <param name="legged_robot_description"
+               command="$(find xacro)/xacro
+                        $(find legged_unitree_description)/urdf/robot.xacro
+                        robot_type:=$(arg robot_type)
+                        namespace:=/$(arg ns)"/>
+
+        <!-- 產生 URDF 檔案到 /tmp/legged_control/dog1_a1.urdf -->
+        <node name="generate_urdf"
+              pkg="legged_common"
+              type="generate_urdf.sh"
+              output="screen"
+              args="$(find legged_unitree_description)/urdf/robot.xacro
+                    $(arg robot_type)
+                    $(arg ns)"/>
+
+        <!-- 在 Gazebo 裡生成模型 -->
+        <node name="spawn_urdf"
+              pkg="gazebo_ros"
+              type="spawn_model"
+              output="screen"
+              args="-x $(arg init_x)
+                    -y $(arg init_y)
+                    -z $(arg init_z)
+                    -param /$(arg ns)/legged_robot_description
+                    -urdf
+                    -model $(arg ns)"/>
+    </group>
+</launch>

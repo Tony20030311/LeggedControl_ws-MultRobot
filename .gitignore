@@ -1,0 +1,9 @@
+build/
+devel/
+logs/
+install/
+.catkin_tools/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store

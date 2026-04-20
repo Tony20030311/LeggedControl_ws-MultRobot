@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!--
+  fleet_bringup.launch
+  ====================
+  用途:啟動五隻狗的控制層。
+  
+  為什麼要用 delay?
+  每隻狗的 controller 初始化時會建立 Pinocchio 模型 + 可能編譯 CppAD 庫。
+  如果五隻狗同時初始化:
+    1. 記憶體瞬間 peak 很高
+    2. 如果 CppAD 要重新編譯,同時寫入同資料夾會 race condition
+    3. Pinocchio 的全域靜態變數可能衝突
+  用 delay 錯開,讓每隻狗依序完成初始化。
+-->
+<launch>
+    <arg name="robot_type" default="a1"/>
+
+    <include file="$(find legged_controllers)/launch/load_controller_multi.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"         value="dog1"/>
+        <arg name="delay"      value="0"/>
+    </include>
+
+    <include file="$(find legged_controllers)/launch/load_controller_multi.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"         value="dog2"/>
+        <arg name="delay"      value="15"/>
+    </include>
+
+    <include file="$(find legged_controllers)/launch/load_controller_multi.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"         value="dog3"/>
+        <arg name="delay"      value="30"/>
+    </include>
+
+    <!-- <include file="$(find legged_controllers)/launch/load_controller_multi.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"         value="dog4"/>
+        <arg name="delay"      value="45"/>
+    </include>
+
+    <include file="$(find legged_controllers)/launch/load_controller_multi.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"         value="dog5"/>
+        <arg name="delay"      value="60"/>
+    </include> -->
+</launch>

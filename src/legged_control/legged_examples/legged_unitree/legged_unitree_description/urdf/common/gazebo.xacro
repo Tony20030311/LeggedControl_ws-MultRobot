@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <xacro:arg name="namespace" default="/"/>
+
+    <gazebo>
+        <plugin name="gazebo_ros_control" filename="liblegged_hw_sim.so">
+            <!-- 原始:<robotNamespace>/</robotNamespace> -->
+            <!-- 修改:每隻狗用自己的 namespace -->
+            <robotNamespace>$(arg namespace)</robotNamespace>
+            <robotParam>$(arg namespace)/legged_robot_description</robotParam>
+            <robotSimType>legged_gazebo/LeggedHWSim</robotSimType>
+        </plugin>
+    </gazebo>
+
+    <gazebo>
+        <plugin name="p3d_base_controller" filename="libgazebo_ros_p3d.so">
+            <alwaysOn>true</alwaysOn>
+            <updateRate>1000.0</updateRate>
+            <bodyName>base</bodyName>
+            <!-- 原始:<topicName>ground_truth/state</topicName> -->
+            <!-- 修改:每隻狗的 ground_truth 在自己 namespace 下 -->
+            <topicName>$(arg namespace)/ground_truth/state</topicName>
+            <gaussianNoise>0</gaussianNoise>
+            <frameName>world</frameName>
+            <xyzOffsets>0 0 0</xyzOffsets>
+            <rpyOffsets>0 0 0</rpyOffsets>
+        </plugin>
+    </gazebo>
+
+</robot>

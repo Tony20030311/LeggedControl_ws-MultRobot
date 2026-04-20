@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="robot_type" default="a1"/>
+    <arg name="ns"/>
+    <arg name="cheater" default="false"/>
+    <arg name="delay"   default="0"/>
+
+    <group ns="$(arg ns)">
+
+        <!-- ========== 參數:Controller 內部讀的 ========== -->
+        <!-- 這些參數放在 /dog1/controllers/legged_controller/ 底下 -->
+        <!-- LeggedController::init() 會用 controller_nh.getParam("urdfFile") 讀 -->
+        <group ns="controllers/legged_controller">
+            <param name="urdfFile"
+                   value="/tmp/legged_control/$(arg ns)_$(arg robot_type).urdf"/>
+            <param name="taskFile"
+                   value="$(find legged_controllers)/config/$(arg robot_type)/task.info"/>
+            <param name="referenceFile"
+                   value="$(find legged_controllers)/config/$(arg robot_type)/reference.info"/>
+            <param name="gaitCommandFile"
+                   value="$(find legged_controllers)/config/$(arg robot_type)/gait.info"/>
+            <param name="robot_name" value="$(arg ns)"/>
+        </group>
+
+        <!-- ========== 參數:獨立 node 讀的 ========== -->
+        <!-- 這些放在 /dog1/ 底下,給 target_trajectories_publisher 讀 -->
+        <param name="referenceFile"
+               value="$(find legged_controllers)/config/$(arg robot_type)/reference.info"/>
+        <param name="taskFile"
+               value="$(find legged_controllers)/config/$(arg robot_type)/task.info"/>
+        <param name="gaitCommandFile"
+               value="$(find legged_controllers)/config/$(arg robot_type)/gait.info"/>
+
+        <rosparam file="$(find legged_controllers)/config/controllers.yaml"
+                  command="load"/>
+        <rosparam file="$(find legged_gazebo)/config/default.yaml"
+                  command="load"/>
+
+        <!-- ========== Controller Loader ========== -->
+        <!-- 關鍵修正 1:args 要同時 load joint_state_controller 和 legged_controller -->
+        <!-- 關鍵修正 2:launch-prefix 要用 $0 $@ 接回原命令 -->
+        <node unless="$(arg cheater)"
+              name="controller_loader"
+              pkg="controller_manager" type="controller_manager"
+              output="screen"
+              launch-prefix="bash -c 'sleep $(arg delay) &amp;&amp; $0 $@'"
+              args="load
+                    controllers/joint_state_controller
+                    controllers/legged_controller"/>
+
+        <!-- cheater 版(state 從 Gazebo ground truth 直接讀,不跑 Kalman):
+             也要同時 load 所有需要的 controller -->
+        <node if="$(arg cheater)"
+              name="controller_loader"
+              pkg="controller_manager" type="controller_manager"
+              output="screen"
+              launch-prefix="bash -c 'sleep $(arg delay) &amp;&amp; $0 $@'"
+              args="load
+                    controllers/joint_state_controller
+                    controllers/legged_controller
+                    controllers/legged_cheater_controller"/>
+
+        <!-- ========== Gait Command ========== -->
+        <!-- OCS2 的步態切換節點,讀 ~robot_name 決定發到哪個 topic -->
+        <!-- 注意:<param> 在 <node> 內部時自動就是 private,不用寫 ~ -->
+        <node pkg="ocs2_legged_robot_ros"
+              type="legged_robot_gait_command"
+              name="legged_robot_gait_command"
+              output="screen">
+            <param name="robot_name" value="$(arg ns)"/>
+        </node>
+
+        <!-- ========== Target Trajectories Publisher ========== -->
+        <!-- 把 cmd_vel / move_base_simple/goal 轉成 MPC target trajectory -->
+        <node pkg="legged_controllers"
+              type="legged_target_trajectories_publisher"
+              name="legged_robot_target"
+              output="screen">
+            <param name="robot_name" value="$(arg ns)"/>
+        </node>
+
+        <!-- 搖桿相關:多機模擬不啟動(若要用可個別啟動) -->
+    </group>
+</launch>

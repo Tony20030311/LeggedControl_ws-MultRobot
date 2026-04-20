@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="robot_type" default="a1"/>
+
+    <!-- ===== 啟動 Gazebo World（只需要一個）===== -->
+    <rosparam file="$(find legged_gazebo)/config/default.yaml" command="load"/>
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name" value="$(find legged_gazebo)/worlds/empty_world.world"/>
+        <arg name="paused" value="false"/>
+        <arg name="use_sim_time" value="true"/>
+        <arg name="gui" value="true"/>
+    </include>
+
+    <!-- ===== 第一隻狗：dog1 ===== -->
+    <group ns="dog1">
+        <!-- 產生 URDF，傳入 namespace=dog1 -->
+        <param name="legged_robot_description"
+               command="$(find xacro)/xacro
+                        $(find legged_unitree_description)/urdf/robot.xacro
+                        robot_type:=$(arg robot_type)
+                        namespace:=/dog1"/>
+
+        <node name="generate_urdf" pkg="legged_common" type="generate_urdf.sh"
+              output="screen"
+              args="$(find legged_unitree_description)/urdf/robot.xacro
+                    $(arg robot_type)
+                    dog1"/>
+
+        <!-- spawn 進 Gazebo，位置 x=0，model 名稱 dog1 -->
+        <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+              output="screen"
+              args="-x 0.0 -y 0.0 -z 0.5
+                    -param /dog1/legged_robot_description
+                    -urdf
+                    -model dog1"/>
+    </group>
+
+    <!-- ===== 第二隻狗：dog2 ===== -->
+    <group ns="dog2">
+        <!-- 產生 URDF，傳入 namespace=dog2 -->
+        <param name="legged_robot_description"
+               command="$(find xacro)/xacro
+                        $(find legged_unitree_description)/urdf/robot.xacro
+                        robot_type:=$(arg robot_type)
+                        namespace:=/dog2"/>
+
+        <node name="generate_urdf" pkg="legged_common" type="generate_urdf.sh"
+              output="screen"
+              args="$(find legged_unitree_description)/urdf/robot.xacro
+                    $(arg robot_type)
+                    dog2"/>
+
+        <!-- spawn 進 Gazebo，位置 x=1.5，model 名稱 dog2 -->
+        <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model"
+              output="screen"
+              args="-x 1.5 -y 0.0 -z 0.5
+                    -param /dog2/legged_robot_description
+                    -urdf
+                    -model dog2"/>
+    </group>
+
+</launch>
