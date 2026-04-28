@@ -1,0 +1,32 @@
+# CBF 參數
+cbf_enabled: true
+cbf_d_min: 1.0
+cbf_gamma: 2.0
+cbf_gamma_obs: 2.0
+cbf_gamma_wall: 2.0
+
+# 編隊 offset (leader body frame)
+offsets:
+  dog2: [-0.6, 0.4]
+  dog3: [-0.6, -0.4]
+
+# 場地內的圓柱障礙物 (物理半徑 0.2m + 安全裕量 0.4m = 0.6m)
+# 左牆用圓形串起來模擬 (洞口 y=-0.6~0.6 之間不放)
+obstacles:
+  - {pos: [6.0, 1.5],  radius: 0.8}
+  - {pos: [6.0, 3.0],  radius: 0.8}
+  - {pos: [6.0, 4.5],  radius: 0.8}
+  - {pos: [6.0, -1.5], radius: 0.8}
+  - {pos: [6.0, -3.0], radius: 0.8}
+  - {pos: [6.0, -4.5], radius: 0.8}
+  - {pos: [7.5, 2.5],  radius: 0.6}
+  - {pos: [8.5, -1.5], radius: 0.6}
+  - {pos: [9.0, 3.5],  radius: 0.6}
+  - {pos: [7.0, -3.0], radius: 0.6}
+  - {pos: [8.0, 0.5],  radius: 0.6}
+
+# 牆壁 (右牆 + 上牆 + 下牆，左牆用 obstacles 模擬因為有洞口)
+walls:
+  - {normal: [-1, 0], point: [10.0, 0],  d_safe: 0.5}
+  - {normal: [0, -1], point: [0, 5.0],   d_safe: 0.5}
+  - {normal: [0, 1],  point: [0, -5.0],  d_safe: 0.5}

@@ -5,7 +5,7 @@
     <!-- Gazebo World:只需要一個,五隻狗共用一個物理模擬器 -->
     <include file="$(find gazebo_ros)/launch/empty_world.launch">
         <arg name="world_name"
-             value="$(find legged_gazebo)/worlds/empty_world.world"/>
+             value="$(find legged_gazebo)/worlds/obstacle_world.world"/>
         <arg name="paused"       value="false"/>
         <arg name="use_sim_time" value="true"/>
         <arg name="gui"          value="true"/>
@@ -19,31 +19,36 @@
     -->
     <include file="$(find legged_unitree_description)/launch/single_dog.launch">
         <arg name="robot_type" value="$(arg robot_type)"/>
-        <arg name="ns" value="dog1"/>  <arg name="init_x" value="0.0"/>
-        <arg name="init_y" value="3.0"/>
-    </include>
-
-    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
-        <arg name="robot_type" value="$(arg robot_type)"/>
-        <arg name="ns" value="dog2"/>  <arg name="init_x" value="1.0"/>
-        <arg name="init_y" value="1.5"/>
-    </include>
-
-    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
-        <arg name="robot_type" value="$(arg robot_type)"/>
-        <arg name="ns" value="dog3"/>  <arg name="init_x" value="2.0"/>
+        <arg name="ns" value="dog1"/>  
+        <arg name="init_x" value="2.0"/>
         <arg name="init_y" value="0.0"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns" value="dog2"/>  
+        <arg name="init_x" value="1.0"/>
+        <arg name="init_y" value="1.0"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns" value="dog3"/>  
+        <arg name="init_x" value="1.0"/>
+        <arg name="init_y" value="-1.0"/>
     </include>
 
     <!-- <include file="$(find legged_unitree_description)/launch/single_dog.launch">
         <arg name="robot_type" value="$(arg robot_type)"/>
-        <arg name="ns" value="dog4"/>  <arg name="init_x" value="1.0"/>
+        <arg name="ns" value="dog4"/>  
+        <arg name="init_x" value="1.0"/>
         <arg name="init_y" value="-1.5"/>
     </include>
 
     <include file="$(find legged_unitree_description)/launch/single_dog.launch">
         <arg name="robot_type" value="$(arg robot_type)"/>
-        <arg name="ns" value="dog5"/>  <arg name="init_x" value="0.0"/>
+        <arg name="ns" value="dog5"/>  
+        <arg name="init_x" value="0.0"/>
         <arg name="init_y" value="-3.0"/>
     </include> -->
    
