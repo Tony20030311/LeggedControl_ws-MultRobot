@@ -23,7 +23,7 @@
 
         <!-- ============================================================
              Arena: 4m depth (x) × 10m length (y)
-             Left long wall at x=6 (with 1.2m opening at y=-0.6..0.6)
+             Left long wall at x=6 (with 2.0m opening at y=-1.0..1.0)
              Right long wall at x=10
              Top short wall at y=5
              Bottom short wall at y=-5
@@ -31,16 +31,16 @@
              Dogs walk ~4m in +x before reaching the opening
              ============================================================ -->
 
-        <!-- Left long wall UPPER: x=6, y=0.6..5 -->
+        <!-- Left long wall UPPER: x=6, y=1.0..5 -->
         <model name="wall_left_upper">
             <static>true</static>
-            <pose>6.0 2.8 0.25  0 0 0</pose>
+            <pose>6.0 3.0 0.25  0 0 0</pose>
             <link name="link">
                 <collision name="col">
-                    <geometry><box><size>0.15 4.4 0.5</size></box></geometry>
+                    <geometry><box><size>0.15 4.0 0.5</size></box></geometry>
                 </collision>
                 <visual name="vis">
-                    <geometry><box><size>0.15 4.4 0.5</size></box></geometry>
+                    <geometry><box><size>0.15 4.0 0.5</size></box></geometry>
                     <material>
                         <ambient>0.6 0.6 0.6 1</ambient>
                         <diffuse>0.6 0.6 0.6 1</diffuse>
@@ -49,16 +49,16 @@
             </link>
         </model>
 
-        <!-- Left long wall LOWER: x=6, y=-5..-0.6 -->
+        <!-- Left long wall LOWER: x=6, y=-5..-1.0 -->
         <model name="wall_left_lower">
             <static>true</static>
-            <pose>6.0 -2.8 0.25  0 0 0</pose>
+            <pose>6.0 -3.0 0.25  0 0 0</pose>
             <link name="link">
                 <collision name="col">
-                    <geometry><box><size>0.15 4.4 0.5</size></box></geometry>
+                    <geometry><box><size>0.15 4.0 0.5</size></box></geometry>
                 </collision>
                 <visual name="vis">
-                    <geometry><box><size>0.15 4.4 0.5</size></box></geometry>
+                    <geometry><box><size>0.15 4.0 0.5</size></box></geometry>
                     <material>
                         <ambient>0.6 0.6 0.6 1</ambient>
                         <diffuse>0.6 0.6 0.6 1</diffuse>

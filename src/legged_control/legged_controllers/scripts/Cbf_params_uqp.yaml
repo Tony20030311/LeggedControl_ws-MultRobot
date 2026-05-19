@@ -1,0 +1,189 @@
+# ═══════════════════════════════════════════════════════════════
+# Cbf_params_uqp.yaml — Unified QP 版本參數
+# 對應 formation_manager_unified_qp.py
+# ═══════════════════════════════════════════════════════════════
+
+# ── CBF 參數（從舊版完整保留）──
+cbf_enabled: true
+cbf_d_min: 1.0
+cbf_gamma: 1.0
+cbf_gamma_obs: 0.5
+cbf_gamma_wall: 1.0
+cbf_slack_lambda: 10000.0
+cbf_slack_warn: 0.05
+cbf_lookahead_tau: 0.30
+
+# ── Unified QP cost 權重（新增）──
+# w_path:      保留舊參數相容性；virtual-center 版本主要由 w_formation 控制 tracking
+# w_formation: centroid-relative target tracking 權重。越大 → 三隻狗越追隊形目標點
+# w_reg:       正則項權重。防止速度過度激進
+#
+# 調參原則:
+#   w_formation 越大越貼近隊形目標，但遇到牆/障礙時 slack 可能變大
+#   kp_pos_follower 越大越快收斂隊形，但也越容易在窄門附近推太急
+#   w_reg 通常 0.05~0.2，太大會讓所有狗動作變慢
+w_path: 1.0
+w_formation: 6.0
+w_reg: 0.1
+
+# ── 編隊 offset 定義（新增）──
+# 每種隊形用 centroid-relative offset 定義，會依照前進方向旋轉
+# 點的順序依序對應 dog1, dog2, dog3；沒有固定 leader anchor
+formations:
+  V:        [[0.55, 0.0], [-0.28, 0.80], [-0.28, -0.80]]
+  V_narrow: [[0.80, 0.0], [-0.20, 0.475], [-0.60, -0.475]]
+  line:     [[1.1, 0.0], [0.0, 0.0], [-1.1, 0.0]]
+
+# 預設隊形
+default_formation: "V"
+
+# ── yaw 追蹤（新增）──
+# 各 robot 的 wz 用 P control 對齊 virtual-center heading，不進 QP
+kp_yaw: 0.6
+
+# ── Centroid-relative offset tracking（新增）──
+# 每隻狗的 vx/vy nominal velocity:
+#   v_i = v_center + kp_pos_follower * (target_offset_position_i - position_i)
+# 越大 → robot 越積極追到 centroid 周圍的指定 offset
+kp_pos_follower: 0.8
+
+# ── Formation target safety projection（新增）──
+# target_pos 太靠近 obstacle / rect / wall 時，先把當下 slot target 往安全側推回來。
+# 這只改 nominal target，不改 formation offset 本身；離開窄區後會自然恢復原隊形。
+target_projection_margin: 0.10
+target_projection_max_shift: 0.45
+
+# ── Robot footprint / drift model（新增）──
+# CBF/A* 的點模型只代表 base center；Gazebo 碰撞會用 body/legs。
+# 這裡用外接矩形估計 body + leg swing，讓「中心點安全線」對應到實際外輪廓。
+robot_footprint_half_length: 0.35
+robot_footprint_half_width: 0.20
+robot_footprint_drift_margin: 0.08
+
+# ── Formation error guard（新增）──
+# assigned slot error 變大時，先降低 centroid 前進速度，避免中心把隊伍越拉越散。
+formation_guard_slow_error: 0.65
+formation_guard_stop_error: 1.10
+formation_guard_min_scale: 0.15
+
+# ── Per-dog A* front-end + soft formation（新增）──
+# AUTO 模式下每隻狗各自規劃 A* path 到 assigned final slot。
+# nominal velocity = dog-specific path tracking + bounded formation-similarity correction。
+# 這是參考 Swarm-Formation 的過渡版：先做 per-agent path seed + soft formation，
+# 還不做完整 MINCO / horizon trajectory optimization。
+per_dog_astar_enabled: true
+per_dog_fail_stop: true
+per_dog_goal_tol: 0.22
+per_dog_goal_unlatch_tol: 0.35
+per_dog_goal_slow_radius: 0.80
+per_dog_final_approach_radius: 0.55
+per_dog_final_approach_kp: 0.90
+per_dog_goal_projection_max_shift: 0.75
+kp_formation_soft: 0.35
+formation_soft_max_speed: 0.18
+
+# ── Dynamic slot assignment（新增）──
+# true: dog1/dog2/dog3 不固定綁定 formation slot，會自動選最近/最合理的位置
+# slot_switch_hysteresis 越大 → 越不容易頻繁換位；太大則可能換位不夠靈敏
+dynamic_slot_assignment: true
+slot_switch_hysteresis: 0.15
+slot_switch_cooldown_seconds: 1.0
+slot_freeze_projection_threshold: 0.08
+
+# ── Narrow-gap A* blocking（新增）──
+# 關掉自動封縫，避免和手寫 forbidden zones 疊加誤傷一般可行區。
+astar_block_narrow_wall_gaps: false
+astar_wall_gap_min_width: 1.10
+astar_wall_gap_lateral_margin: 0.20
+# 0:A, 1:B, 2:C, 3:D, 4:E；實測只封 C/D 和牆之間的窄縫。
+astar_wall_gap_obstacle_indices: [2, 3]
+
+# 保留可調 planning margin；圓柱半徑已含 robot footprint + 原地 trot 漂移 buffer。
+astar_formation_margin_v: 0.10
+astar_formation_margin_line: 0.10
+astar_fallback_to_base_map: true
+
+# forbidden zones 同時用在 centroid A* 和每隻狗的 QP/target projection。
+# 目標是讓「規劃層」與「個別狗控制層」都把 C/D 與牆之間的窄縫當禁區。
+forbidden_zones_enabled: false
+forbidden_zone_d_safe: 0.15
+astar_forbidden_zones:
+  # obstacle C ([9.0, 3.5]) 與右牆之間的縫；避免 top-right corner 被當成可鑽路線。
+  - {name: "obs_c_right_wall_gap", center: [9.55, 3.50], size: [0.75, 1.55], escape_dir: [-1.0, 0.0]}
+  # 右側下方圓柱與右牆之間的窄縫；避免從右側直線硬切上下。
+  - {name: "obs_d_right_wall_gap", center: [9.25, -1.50], size: [1.25, 1.45], escape_dir: [-1.0, 0.0]}
+  # obstacle D ([7.0, -3.0]) 與下牆之間的縫；底部只保留右側較寬通道。
+  - {name: "obs_d_bottom_gap", center: [7.0, -4.12], size: [1.80, 0.86], escape_dir: [0.0, 1.0]}
+
+# Goal 若落在 occupied/forbidden 區，nearest_free 修正超過此距離就拒絕，
+# 避免 goal 被偷偷改到很遠的位置。
+astar_goal_adjust_max_dist: 0.75
+astar_goal_min_obstacle_clearance: 0.10
+astar_goal_min_wall_clearance: 0.50
+
+# ── Formation-level command topics（新增）──
+goal_topic: "/formation/goal"
+cmd_vel_raw_topic: "/formation/cmd_vel_raw"
+
+# ── Debug topics for RViz（新增）──
+debug_publish_enabled: true
+debug_frame_id: "map"
+debug_obstacle_physical_radius: 0.20
+
+# ── 自動隊形切換（取代 DoorPassageManager）──
+door_mode_enabled: true
+door_x: 6.0
+door_passage_formation: "V_narrow"
+door_line_formation: "V_narrow"  # 舊參數名相容；門口改用窄三角形，不切單列。
+door_trigger_dist: 2.0    # 任一狗/centroid 距門 < 此值且需穿門 → 切窄三角形
+door_release_dist: 1.8    # 全隊離門 > 此值 → 切回 V
+
+# ── Stuck detection（從舊版保留）──
+stuck_speed_threshold: 0.05
+stuck_replan_cycles: 10
+stuck_replan_cooldown: 30
+stuck_max_replans: 3
+
+# ── Velocity limits（從舊版保留）──
+max_vx: 0.60
+max_vy: 0.45
+max_wz: 0.8
+
+# ── A* 路徑規劃參數（從舊版保留）──
+astar_resolution: 0.1
+astar_robot_radius: 0.15
+astar_boundary_margin: 0.55
+map_x_min: 0.0
+map_x_max: 10.0
+map_y_min: -5.0
+map_y_max: 5.0
+
+# ── Pure Pursuit 參數（從舊版保留）──
+pp_look_ahead: 0.8
+pp_v_cruise: 0.50
+pp_kp_yaw: 0.6
+pp_goal_tol: 0.3
+
+# ── Goal hold（新增）──
+# AUTO 到達 goal 後短暫全隊歸零，避免在目標附近繼續互相修隊形/CBF 磨蹭
+goal_hold_seconds: 2.0
+cmd_vel_raw_timeout: 0.4
+cmd_vel_raw_deadband: 0.001
+
+# ── 場地障礙物（從舊版保留）──
+rect_obstacles:
+  # Door wall keeps a smaller margin than outer walls so the 2.0m opening remains passable.
+  - {center: [6.0, 3.0],  size: [0.15, 4.0], d_safe: 0.40, astar_margin: 0.45}
+  - {center: [6.0, -3.0], size: [0.15, 4.0], d_safe: 0.40, astar_margin: 0.45}
+
+obstacles:
+  - {pos: [7.5, 2.5],   physical_radius: 0.20, radius: 0.55, astar_radius: 0.55}
+  - {pos: [8.5, -1.5],  physical_radius: 0.20, radius: 0.55, astar_radius: 0.55}
+  - {pos: [9.0, 3.5],   physical_radius: 0.20, radius: 0.55, astar_radius: 0.55}
+  - {pos: [7.0, -3.0],  physical_radius: 0.20, radius: 0.55, astar_radius: 0.55}
+  - {pos: [8.0, 0.5],   physical_radius: 0.20, radius: 0.55, astar_radius: 0.55}
+
+walls:
+  - {normal: [-1, 0], point: [10.0, 0],  d_safe: 0.45}
+  - {normal: [0, -1], point: [0, 5.0],   d_safe: 0.45}
+  - {normal: [0, 1],  point: [0, -5.0],  d_safe: 0.45}

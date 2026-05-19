@@ -1,0 +1,135 @@
+# CBF 參數
+cbf_enabled: true  # false ＝ CBF不介入
+cbf_d_min: 1.0 # robot-robot 的最小安全距離（公尺）
+cbf_gamma: 1.0 # robot-robot CBF 的積極程度
+# γ 越「小」越保守（h>0 時允許的接近速度小，等於提早煞車）
+# 撞牆問題的關鍵就在 obstacle 這一條，從 1.0 降到 0.5 → 同樣 h 下，允許接近速度減半
+cbf_gamma_obs: 0.5
+cbf_gamma_wall: 1.0
+
+# CBF Slack（L1 軟化約束，避免 QP infeasible 死掉）
+cbf_slack_lambda: 10000.0  # ε 違反懲罰：大→近硬約束，小→易違反；典型 1e3~1e5
+cbf_slack_warn: 0.05       # 最大 ε > 此值時記 warning（單位：constraint 同單位）
+
+# Predictive CBF（補償 MPC tracking lag）
+# CBF 不只看 p，也看 p + v·τ，等效於「以未來 τ 秒位置為基準做安全判斷」
+# τ 越大越保守（早煞車）、但門廊變窄；τ 太小回到原本撞牆問題
+# 從 0.15 → 0.30 是因為 OCS2 MPC + WBC + Gazebo 的實際反應約 0.2~0.3s
+cbf_lookahead_tau: 0.30    # 秒，建議 0.10~0.30，與 MPC 反應時間相當
+
+# Stuck detection（L2：CBF 卡死時自動 replan A*）
+stuck_speed_threshold: 0.05   # leader |v| 低於此值 (m/s) 算靜止
+stuck_replan_cycles: 10       # 連續靜止 cycle 數 → 觸發 replan（10 cycles = 0.5s @ 20Hz）
+stuck_replan_cooldown: 30     # replan 後 cooldown cycle 數，避免抖動（30 cycles = 1.5s）
+stuck_max_replans: 3          # 同一 stuck 最多連續 replan 次數，超過視為真死局
+
+# Normal formation offset (leader body frame) [前後, 左右]
+# Gazebo 初始站位: dog1(2,0), dog2(1,1), dog3(1,-1)，所以正常隊形要對應 [-1,+1]/[-1,-1]。
+# 門口窄隊形不要放在這裡；由 DoorPassageManager 在進/出門時暫時切成 single-file queue。
+offsets:
+  dog2: [-1.0, 1.0]
+  dog3: [-1.0, -1.0]
+
+# Step 1: Follower 靜止 (設 false 啟用 Step 2+ P control)
+followers_stationary: false
+follower_align_yaw: false     # false: 到位後不為了 yaw 原地自轉
+follower_align_yaw_while_moving: true  # 只有追 target 時才順便對齊 leader/path yaw
+follower_yaw_move_dist: 0.15  # 位置誤差大於此值才修 yaw，避免啟動時小誤差純自轉
+
+# Formation tracking gain
+# 提高 follower nominal 追蹤力道，讓隊形優先感更強；CBF 仍會在牆/障礙/狗距離太近時接管。
+kp_x: 1.35
+kp_y: 1.20
+kp_yaw: 1.35
+pos_tolerance: 0.10
+yaw_tolerance: 0.15
+
+# Velocity limits
+max_vx: 0.55
+max_vy: 0.35
+max_wz: 0.8
+
+# A* 路徑規劃參數
+astar_resolution: 0.1       # 格子大小 (m)
+astar_robot_radius: 0.15    # A* 的障礙物膨脹半徑（公尺）
+astar_boundary_margin: 0.45 # 與 wall CBF d_safe 對齊，避免 A* 把 goal 放到牆角安全邊界內
+map_x_min: 0.0
+map_x_max: 10.0
+map_y_min: -5.0
+map_y_max: 5.0 # A* 規劃路徑的範圍
+
+# Follower path-aware formation tracking
+follower_replan_dist: 0.35     # formation target 移動超過此距離才重規劃
+follower_replan_cycles: 20     # AUTO 中每 1s 更新 follower A* 路徑（20Hz）
+follower_direct_dist: 0.8      # target 附近且直線不穿牆時，交回 PID 精準對位
+
+# Door passage mode (formation_managerCBF_door.py)
+# 只有 leader 與 goal 分別在門的兩側時才變換隊形；支援 x<6→x>6 進門與 x>6→x<6 出門。
+# dog3 清過門後就釋放回一般 formation，FollowerPathTracker 會在 target 隔牆時自動 A* 繞路追上。
+door_mode_enabled: true
+door_x: 6.0
+door_y: 0.0
+door_detect_x_before: 0.9
+door_detect_x_after: 0.9
+door_detect_y: 1.1
+door_leader_pass_x: 6.55
+door_follower_pass_x: 6.45
+door_queue_leader_gap: 1.15
+door_queue_dog_gap: 1.25
+door_pass_y: 0.28
+door_side_clear_y: 0.85
+
+# Pure Pursuit 參數
+pp_look_ahead: 0.35    # 窄門場景要看近一點，避免 Pure Pursuit 斜切門角
+pp_v_cruise: 0.3      # 過門與牆角測試先慢一點，降低 MPC tracking lag 的 overshoot
+                       # 撞牆風險顯著降低（overshoot 距離 ~ v·τ_lag）
+pp_kp_yaw: 1.4         # 朝向 P-gain
+pp_goal_tol: 0.3       # 目標到達判定距離 (m)
+
+# ─── Gazebo 真實幾何（obstacle_world.world）──────────────────────
+# wall_left_upper: 矩形 box，pose=(6, 2.8)，size=(0.15, 4.4) → 佔 x∈(5.925, 6.075)、y∈(0.6, 5.0)
+# wall_left_lower: 同上鏡像 → y∈(-5.0, -0.6)
+# 門口（缺口）: x=6, y∈(-0.6, 0.6)，寬 1.2m
+# 5 顆實體圓柱: r=0.2m，分布在 x∈(7~9)
+# ────────────────────────────────────────────────────────────────
+# 左牆改用 finite rectangle 描述真實 box；圓形 obstacles 只保留場地內 5 顆圓柱。
+rect_obstacles:
+  - {center: [6.0, 2.8],  size: [0.15, 4.4], d_safe: 0.45, astar_margin: 0.45}
+  - {center: [6.0, -2.8], size: [0.15, 4.4], d_safe: 0.45, astar_margin: 0.45}
+
+obstacles:
+  # ── 5 顆實體圓柱 (Gazebo 真實物體 r=0.2m，CBF 用 0.6m 含 0.4m 安全裕量) ──
+  - {pos: [7.5, 2.5],   radius: 0.6, astar_radius: 0.55}
+  - {pos: [8.5, -1.5],  radius: 0.6, astar_radius: 0.55}
+  - {pos: [9.0, 3.5],   radius: 0.6, astar_radius: 0.55}
+  - {pos: [7.0, -3.0],  radius: 0.6, astar_radius: 0.55}
+  - {pos: [8.0, 0.5],   radius: 0.6, astar_radius: 0.55}
+
+# 牆壁 (右牆 + 上牆 + 下牆，左牆用 obstacles 模擬因為有洞口)
+walls:
+  - {normal: [-1, 0], point: [10.0, 0],  d_safe: 0.5}
+  - {normal: [0, -1], point: [0, 5.0],   d_safe: 0.5}
+  - {normal: [0, 1],  point: [0, -5.0],  d_safe: 0.5}
+
+
+
+#   0.2m
+#         ┌──────┐
+#         │ 圓柱 │          ← 真實物體
+#         └──────┘
+
+#     ── 0.6m ──
+#    ╔══════════════╗       ← CBF 安全邊界
+#    ║   ┌──────┐   ║         機器人中心不能進來
+#    ║   │ 圓柱 │   ║
+#    ║   └──────┘   ║
+#    ╚══════════════╝
+
+#   ──── 0.85m ────
+#  ┌────────────────────┐   ← A* 不可走範圍
+#  │  ╔══════════════╗  │     （CBF 0.6 + robot 0.25）
+#  │  ║   ┌──────┐   ║  │
+#  │  ║   │ 圓柱 │   ║  │
+#  │  ║   └──────┘   ║  │
+#  │  ╚══════════════╝  │
+#  └────────────────────┘
