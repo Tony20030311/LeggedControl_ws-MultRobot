@@ -52,7 +52,7 @@ Task WeightedWbc::formulateConstraints() {
 }
 
 Task WeightedWbc::formulateWeightedTasks(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
-  return formulateSwingLegTask() * weightSwingLeg_ + formulateBaseAccelTask(stateDesired, inputDesired, period) * weightBaseAccel_ +
+  return formulateSwingLegTask() * weightSwingLeg_ + formulateBaseMotionTrackingTask(stateDesired, inputDesired, period) * weightBaseAccel_ +
          formulateContactForceTask(inputDesired) * weightContactForce_;
 }
 

@@ -1,0 +1,28 @@
+<?xml version="1.0" ?>
+<sdf version="1.5">
+  <world name="default">
+
+    <physics type="ode">
+      <type>world</type>
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+      <iters>500</iters>
+    </physics>
+
+    <!-- 光源 -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- 地板 -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- 你的牆壁與障礙物場景 -->
+    <include>
+      <uri>model://my_world</uri>
+    </include>
+
+  </world>
+</sdf>

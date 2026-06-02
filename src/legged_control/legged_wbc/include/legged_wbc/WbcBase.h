@@ -24,6 +24,13 @@ class WbcBase {
 
   virtual void loadTasksSetting(const std::string& taskFile, bool verbose);
 
+  // Upper-layer QP acceleration compensation, called once per control cycle.
+  void setUpperLayerAccel(scalar_t ax, scalar_t ay) {
+    upperLayerAccel_.setZero();
+    upperLayerAccel_(0) = ax;
+    upperLayerAccel_(1) = ay;
+  }
+
   virtual vector_t update(const vector_t& stateDesired, const vector_t& inputDesired, const vector_t& rbdStateMeasured, size_t mode,
                           scalar_t period);
 
@@ -37,7 +44,7 @@ class WbcBase {
   Task formulateTorqueLimitsTask();
   Task formulateNoContactMotionTask();
   Task formulateFrictionConeTask();
-  Task formulateBaseAccelTask(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period);
+  Task formulateBaseMotionTrackingTask(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period);
   Task formulateSwingLegTask();
   Task formulateContactForceTask(const vector_t& inputDesired) const;
 
@@ -48,14 +55,19 @@ class WbcBase {
   std::unique_ptr<PinocchioEndEffectorKinematics> eeKinematics_;
   CentroidalModelPinocchioMapping mapping_;
 
-  vector_t qMeasured_, vMeasured_, inputLast_;
+  vector_t qMeasured_, vMeasured_, qDesired_, vDesired_, inputLast_;
   matrix_t j_, dj_;
   contact_flag_t contactFlag_{};
   size_t numContacts_{};
 
+  // Upper-layer QP acceleration feedforward (x, y only).
+  Vector6 upperLayerAccel_;
+
   // Task Parameters:
   vector_t torqueLimits_;
   scalar_t frictionCoeff_{}, swingKp_{}, swingKd_{};
+  scalar_t baseMotionKpPosition_{0.0}, baseMotionKdPosition_{0.0};
+  bool useBaseCentroidalAccel_{true}, useBasePoseFeedback_{true};
 };
 
 }  // namespace legged

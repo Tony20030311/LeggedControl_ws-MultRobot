@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "Bash(python3)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile Formation_manager_unified_twoOrderCBF.py)",
+      "Bash(python3 -c \"import yaml; c=yaml.safe_load\\(open\\('Cbf_params_twoOrderCBF.yaml'\\)\\); print\\('d_min', c['cbf_d_min']\\); print\\('g1', c['cbf_gamma1'], 'g2', c['cbf_gamma2']\\); print\\('obs', c['cbf_gamma_obs_1'], c['cbf_gamma_obs_2']\\); print\\('wall', c['cbf_gamma_wall_1'], c['cbf_gamma_wall_2']\\); print\\('tau', c['cbf_lookahead_tau']\\)\")",
+      "Bash(awk '{print $6, $NF}')",
+      "Bash(xargs ls -la --time-style=+%Y-%m-%d_%H:%M:%S)",
+      "Bash(python3 -c \"import yaml; c=yaml.safe_load\\(open\\('Cbf_params_twoOrderCBF.yaml'\\)\\); print\\('scale=', c['accel_injection_scale']\\)\")",
+      "Bash(awk -F'def ' '/_build_nominal_velocity|_update_dog_paths|_dog_paths|_per_dog|_slot|_formation_center|_compute_formation|_replan|_target|_project|_formation_yaw|_reset_per_dog|_per_dog_goals_reached|_bootstrap|_dog_path_goal/ {print}')",
+      "Read(//home/tony/.ros/log/**)",
+      "Bash(python3 -c \"import yaml; c=yaml.safe_load\\(open\\('Cbf_params_twoOrderCBF.yaml'\\)\\); print\\('slack_lambda=', c['slack_lambda'], type\\(c['slack_lambda']\\).__name__\\); print\\('slack_warn=', c['slack_warn_threshold']\\); print\\('d_min=', c['cbf_d_min']\\); print\\('inj_scale=', c['accel_injection_scale']\\)\")",
+      "Bash(python3 -c \"import yaml; c=yaml.safe_load\\(open\\('Cbf_params_twoOrderCBF.yaml'\\)\\); print\\('slack_lambda=', c['slack_lambda'], type\\(c['slack_lambda']\\).__name__\\)\")",
+      "Bash(python3 -c \"import matplotlib; matplotlib.use\\('Agg'\\); import matplotlib.pyplot as plt; print\\('matplotlib', matplotlib.__version__, 'OK'\\)\")",
+      "Bash(python3 cbf_proof.py)",
+      "Bash(python3 -c \"import PIL; print\\('PIL', PIL.__version__\\)\")",
+      "Bash(python3 -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python3 cbf_plot.py)",
+      "Bash(python3 -c \"import yaml; yaml.safe_load\\(open\\('Cbf_params_twoOrderCBF.yaml'\\)\\); print\\('✓ YAML 格式正確'\\)\")"
     ]
   }
 }

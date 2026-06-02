@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-formation_manager_unified_qp.py — 統一上層 QP 多機編隊管理器
+Formation_manager_unified_twoOrderCBF.py — 二階 CBF 上層 QP 多機編隊管理器
 
 基於 formation_managerCBF_door.py 改寫：
   - 保留: StateCollector, AStarPlanner, PurePursuitController,
@@ -8,8 +8,8 @@ formation_manager_unified_qp.py — 統一上層 QP 多機編隊管理器
   - 刪除: FormationPlanner, NominalController, FollowerPathTracker,
           DoorPassageManager
   - 新增: LaplacianFormation, FormationSwitcher
-  - 升級: CBFSafetyFilter → UnifiedQPController
-          (objective 改為 per-dog/centroid nominal velocity tracking + CBF)
+  - 升級: CBFSafetyFilter → TwoOrderCBFQPController
+          (用 acceleration HOCBF 產生安全 cmd_vel)
 
 架構:
     FleetManagerUQP
@@ -21,24 +21,25 @@ formation_manager_unified_qp.py — 統一上層 QP 多機編隊管理器
     ├── LaplacianFormation       隊形切換 offsets + Laplacian 診斷 cost
     ├── FormationSwitcher        自動偵測窄門 → 切換 L̂_des
     ├── Per-dog A* front-end     AUTO 時每隻狗各自規劃到 assigned final slot
-    ├── UnifiedQPController      統一 QP (path tracking + Laplacian formation cost + CBF)
+    ├── TwoOrderCBFQPController  二階 CBF QP (acceleration → cmd_vel)
     ├── VelocityLimiter          限制 vx, vy, wz
     └── CmdVelPublisher          發布 /dogN/cmd_vel
 
-資料流 (20Hz):
+資料流:
     StateCollector → positions
     LeaderNavigator → AUTO goal 或 manual u_ref_center
     LaplacianFormation → centroid-relative offsets
     FormationSwitcher → 可能切換 L̂_des
     AUTO: per-dog A* + Pure Pursuit → u_nom_i，加 QP Laplacian formation cost
     KEYBOARD/fallback: centroid-relative target tracking → u_nom_i
-    UnifiedQPController → u_safe × 3
-        objective: w_track·Σ_i‖u_i-u_nom_i‖² + w_formation·ḟ_form
-                 + w_reg·‖u‖² + λ·‖ε‖²
-        constraint: CBF pairwise + obstacle + rect + wall (全部保留)
+    TwoOrderCBFQPController → u_safe × 3
+        decision: a_i = [ax_i, ay_i], u_next = u_measured + a_i dt
+        objective: w_track·Σ_i‖a_i-a_nom_i‖² + w_formation·f̈_form
+                 + w_accel·‖a‖²
+        constraint: HOCBF pairwise + obstacle + rect + wall
     VelocityLimiter → CmdVelPublisher → /dogN/cmd_vel → OCS2 MPC
 
-啟動: rosrun legged_controllers Formation_manager_unified_qp.py
+啟動: rosrun legged_controllers Formation_manager_unified_twoOrderCBF.py
 """
 
 import heapq
@@ -50,14 +51,14 @@ import yaml
 import numpy as np
 import cvxpy as cp
 import rospy
-from geometry_msgs.msg import Point, Twist, PoseStamped, PoseArray
+from geometry_msgs.msg import Point, Twist, PoseStamped, PoseArray, Vector3
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 from visualization_msgs.msg import Marker, MarkerArray
 
 # ── 讀取 YAML config ──
 _CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "Cbf_params_uqp.yaml"
+    os.path.dirname(os.path.abspath(__file__)), "Cbf_params_twoOrderCBF.yaml"
 )
 
 
@@ -462,17 +463,18 @@ class AStarPlanner:
         candidates.sort(key=lambda item: item[0])
         return [point for _, point in candidates]
 
-    def nearest_free(self, goal, max_dist=None):
+    def nearest_free(self, goal, max_dist=None, label="Goal"):
         candidates = self._nearest_free_candidates(goal, max_dist=max_dist)
         if not candidates:
             if max_dist is not None:
-                rospy.logwarn("[A*] Goal occupied; no free cell within %.2fm", max_dist)
+                rospy.logwarn("[A*] %s occupied; no free cell within %.2fm",
+                              label, max_dist)
                 return None
             return goal
         free = candidates[0]
         if math.hypot(free[0] - goal[0], free[1] - goal[1]) > 1e-6:
-            rospy.logwarn("[A*] Goal occupied (%s margin %.2fm) → nearest free (%.2f, %.2f)",
-                          self._planning_label, self._planning_margin,
+            rospy.logwarn("[A*] %s occupied (%s margin %.2fm) → nearest free (%.2f, %.2f)",
+                          label, self._planning_label, self._planning_margin,
                           free[0], free[1])
         return free
 
@@ -1209,36 +1211,45 @@ class FormationSwitcher:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Module 4': UnifiedQPController（升級自 CBFSafetyFilter）
+# Module 4': TwoOrderCBFQPController（relative-degree-2 CBF）
 # ═══════════════════════════════════════════════════════════════
 
-class UnifiedQPController:
+class TwoOrderCBFQPController:
     """
-    統一上層 QP：nominal velocity tracking + CBF 安全約束。
+    上層二階 CBF QP：用 acceleration 作為決策變數，再積分成 cmd_vel。
 
-    與舊版 CBFSafetyFilter 的差異:
-      - objective 從 ‖u - u_nom‖² 升級為多項 cost
-      - constraint 建構邏輯完全保留（robot-robot + obstacle + rect + wall + predictive）
-      - nominal velocity 由 centroid-relative offset tracking 產生
+    決策變數:
+        a = [ax1, ay1, ax2, ay2, ax3, ay3]，body frame acceleration
+        u_next = u_measured + a * dt
 
-    決策變數: u = [vx1, vy1, vx2, vy2, vx3, vy3] (body frame)
-    wz pass-through 不進 QP。
+    CBF:
+        h(p) >= 0
+        psi1 = hdot + gamma1 * h
+        psi1_dot + gamma2 * psi1 >= 0
+
+    也就是:
+        hddot + (gamma1 + gamma2) * hdot + gamma1 * gamma2 * h >= 0
 
     QP 公式:
-        min  w_track · Σ_i ‖u_i − u_nom_i‖²
-           + w_formation · Σ_i ∂f/∂p_i · R_i u_i dt ← Laplacian formation cost
-           + w_reg  · ‖u‖²                      ← 正則項（防發散）
-           + λ      · ‖ε‖²                      ← slack 懲罰
+        min  w_track · ||a - a_des||²
+           + w_formation · grad_f^T (0.5 * R_i a_i * dt²)
+           + w_accel · ||a||²
 
-        s.t. A_cbf · u ≥ b_cbf − ε              ← 所有 CBF 約束（不動）
-             ε ≥ 0
+        s.t. A_hocbf · a >= b_hocbf
+             等價於 hddot + (gamma1 + gamma2) * hdot
+                  + gamma1 * gamma2 * h >= 0
+             |a| <= a_max
+             |u_next| <= u_max
     """
 
     def __init__(self, gamma_robot, d_min, gamma_obs=1.0, gamma_wall=1.0,
-                 slack_lambda=1e4, slack_warn_threshold=0.05,
+                 gamma_robot_1=None, gamma_robot_2=None,
+                 gamma_obs_1=None, gamma_obs_2=None,
+                 gamma_wall_1=None, gamma_wall_2=None,
                  lookahead_tau=0.15,
-                 w_path=1.0, w_track=5.0, w_formation=0.0, w_reg=0.1,
-                 max_vx=0.55, max_vy=0.35,
+                 w_path=1.0, w_track=5.0, w_formation=0.0, w_reg=0.0,
+                 w_accel=0.5,
+                 max_vx=0.55, max_vy=0.35, max_ax=1.0, max_ay=1.0,
                  footprint_half_length=0.35,
                  footprint_half_width=0.20,
                  footprint_drift_margin=0.08,
@@ -1246,40 +1257,86 @@ class UnifiedQPController:
                  prediction_horizon=1,
                  prediction_dt=0.0,
                  w_smooth=0.2,
-                 laplacian_ref=None):
-        # ── CBF 參數（從舊版完整保留）──
-        self.gamma_robot = gamma_robot
-        self.d_min       = d_min
-        self.d_min_sq    = d_min ** 2
-        self.gamma_obs   = gamma_obs
-        self.gamma_wall  = gamma_wall
-        self.obstacles   = []
+                 w_pred=20.0,
+                 laplacian_ref=None,
+                 K_accel=4.0,
+                 Kd_accel=2.0,
+                 emergency_brake_time=0.20,
+                 slack_lambda=1e4,
+                 slack_warn_threshold=0.05,
+                 slack_enabled=True,
+                 gamma_vel=1.0,
+                 gamma_vel_pair=2.0):
+        # ── CBF 參數 ──
+        self.gamma_robot = float(gamma_robot)
+        self.gamma_obs = float(gamma_obs)
+        self.gamma_wall = float(gamma_wall)
+        self.gamma_robot_1 = float(
+            self.gamma_robot if gamma_robot_1 is None else gamma_robot_1)
+        self.gamma_robot_2 = float(
+            self.gamma_robot if gamma_robot_2 is None else gamma_robot_2)
+        self.gamma_obs_1 = float(
+            self.gamma_obs if gamma_obs_1 is None else gamma_obs_1)
+        self.gamma_obs_2 = float(
+            self.gamma_obs if gamma_obs_2 is None else gamma_obs_2)
+        self.gamma_wall_1 = float(
+            self.gamma_wall if gamma_wall_1 is None else gamma_wall_1)
+        self.gamma_wall_2 = float(
+            self.gamma_wall if gamma_wall_2 is None else gamma_wall_2)
+        self.d_min = float(d_min)
+        self.d_min_sq = self.d_min ** 2
+        self.obstacles = []
         self.rect_obstacles = []
-        self.walls       = []
-        self.slack_lambda = float(slack_lambda)
-        self.slack_warn_threshold = float(slack_warn_threshold)
-        self.last_max_slack = 0.0
+        self.walls = []
+        self.last_cbf_status = "ok"
         self.lookahead_tau = float(lookahead_tau)
 
-        # ── 新增: QP cost 權重 ──
-        self.w_path      = float(w_path)
-        self.w_track     = float(w_track)
+        # ── QP cost / bounds ──
+        self.w_path = float(w_path)
+        self.w_track = float(w_track)
         self.w_formation = float(w_formation)
-        self.w_reg       = float(w_reg)
-        self.max_vx      = float(max_vx)
-        self.max_vy      = float(max_vy)
+        self.w_reg = float(w_reg)
+        self.w_accel = float(w_accel)
+        self.max_vx = float(max_vx)
+        self.max_vy = float(max_vy)
+        self.max_ax = float(max_ax)
+        self.max_ay = float(max_ay)
         self.footprint_half_length = max(0.0, float(footprint_half_length))
         self.footprint_half_width = max(0.0, float(footprint_half_width))
         self.footprint_drift_margin = max(0.0, float(footprint_drift_margin))
+        self.prediction_requested = bool(prediction_enabled)
+        # 二階 multi-step preview 已實作；prediction_enabled=true 時走 horizon QP。
         self.prediction_enabled = bool(prediction_enabled)
         self.prediction_horizon = max(1, int(prediction_horizon))
         self.prediction_dt = max(0.0, float(prediction_dt))
         self.w_smooth = float(w_smooth)
+        self.w_pred = float(w_pred)
         self.laplacian_ref = laplacian_ref
-        self._last_V_sol = None
+        # Upper-layer nominal acceleration PD gains. K_accel is kept as the
+        # position gain for backward compatibility with the old P-only version.
+        self.K_accel = float(K_accel)
+        self.Kd_accel = float(Kd_accel)
+        self.emergency_brake_time = max(1e-3, float(emergency_brake_time))
+        # ── HOCBF soft constraints (slack) ──
+        # 高 λ：可行時 ε=0（等同硬 CBF）；只有原本 infeasible 才鬆，且最小違反。
+        self.slack_lambda = float(slack_lambda)
+        self.slack_warn_threshold = float(slack_warn_threshold)
+        # False = 純硬 CBF(驗證用):h≥0 才是真保證;不可行→emergency brake。
+        self.slack_enabled = bool(slack_enabled)
+        # Deprecated: kept only for YAML/launch backward compatibility.
+        # Pure second-order HOCBF no longer adds the extra velocity-layer CBF.
+        self.gamma_vel = float(gamma_vel)
+        self.gamma_vel_pair = float(gamma_vel_pair)
+        self.last_max_slack = 0.0
+        self.last_slack_by_kind = {}
+        self.last_min_h_by_kind = {}
+        self._last_a_sol = None
+        self._last_A_seq = None  # multi-step 暖啟動:上一輪整段加速度序列
+        self.last_accel_cmds = {}
         self.last_prediction_paths = {}
         self.last_reference_paths = {}
         self.last_prediction_dt = 0.0
+        self._prediction_fallback_warned = False
 
     def _footprint_support_along(self, normal, yaw):
         normal = np.array(normal[:2], dtype=float)
@@ -1297,70 +1354,248 @@ class UnifiedQPController:
 
     def set_obstacles(self, obstacles):
         self.obstacles = obstacles
-        rospy.loginfo("[UnifiedQP] %d obstacles loaded", len(obstacles))
+        rospy.loginfo("[TwoOrderCBF] %d obstacles loaded", len(obstacles))
 
     def set_rect_obstacles(self, rect_obstacles):
         self.rect_obstacles = rect_obstacles
-        rospy.loginfo("[UnifiedQP] %d rect obstacles loaded", len(rect_obstacles))
+        rospy.loginfo(
+            "[TwoOrderCBF] %d rect obstacles loaded", len(rect_obstacles))
 
     def set_walls(self, walls):
         self.walls = walls
-        rospy.loginfo("[UnifiedQP] %d walls loaded", len(walls))
+        rospy.loginfo("[TwoOrderCBF] %d walls loaded", len(walls))
 
     def reset_prediction(self, reason=""):
-        self._last_V_sol = None
+        self._last_a_sol = None
+        self._last_A_seq = None
+        self.last_accel_cmds = {}
         self.last_prediction_paths = {}
         self.last_reference_paths = {}
         self.last_prediction_dt = 0.0
         if reason:
-            rospy.logdebug("[UnifiedQP] reset prediction: %s", reason)
+            rospy.logdebug("[TwoOrderCBF] reset prediction: %s", reason)
 
-    def solve(self, all_dogs, states, u_nominal, formation_grad=None,
-              cbf_enabled=True, dt=0.05):
-        if not self.prediction_enabled or self.prediction_horizon <= 1:
-            self.reset_prediction()
-            return self._solve_single_step(
-                all_dogs,
-                states,
-                u_nominal,
+    @staticmethod
+    def _hocbf_rhs(h, hdot, hddot_free, gamma_1, gamma_2):
+        return (
+            -float(hddot_free)
+            - (float(gamma_1) + float(gamma_2)) * float(hdot)
+            - float(gamma_1) * float(gamma_2) * float(h)
+        )
+
+    def _accel_bounds_from_current_velocity(self, u_now, dt, n_dogs):
+        lb = np.zeros(2 * n_dogs)
+        ub = np.zeros(2 * n_dogs)
+        for idx in range(n_dogs):
+            x = 2 * idx
+            y = x + 1
+            lb[x] = max(-self.max_ax, (-self.max_vx - u_now[x]) / dt)
+            ub[x] = min(self.max_ax, ( self.max_vx - u_now[x]) / dt)
+            lb[y] = max(-self.max_ay, (-self.max_vy - u_now[y]) / dt)
+            ub[y] = min(self.max_ay, ( self.max_vy - u_now[y]) / dt)
+        return lb, ub
+
+    def _log_hocbf_infeasible_diagnostics(self, A_rows, b_rows, row_meta,
+                                          u_now, dt, n_dogs):
+        if not A_rows:
+            return
+
+        A = np.array(A_rows, dtype=float)
+        b = np.array(b_rows, dtype=float)
+        lb, ub = self._accel_bounds_from_current_velocity(u_now, dt, n_dogs)
+
+        lhs_max = np.sum(np.where(A >= 0.0, A * ub, A * lb), axis=1)
+        gap = b - lhs_max
+        impossible = gap > 1e-6
+
+        by_kind = {}
+        for k, meta in enumerate(row_meta):
+            kind = meta.get("kind", "unknown")
+            stats = by_kind.setdefault(
+                kind,
+                {"count": 0, "impossible": 0, "min_h": float("inf")},
+            )
+            stats["count"] += 1
+            stats["impossible"] += int(impossible[k])
+            stats["min_h"] = min(stats["min_h"], float(meta.get("h", 0.0)))
+
+        summary = ", ".join(
+            "%s %d/%d min_h=%.3f"
+            % (kind, stats["impossible"], stats["count"], stats["min_h"])
+            for kind, stats in sorted(by_kind.items())
+        )
+
+        worst_idx = int(np.argmax(gap))
+        worst_meta = row_meta[worst_idx]
+        rospy.logwarn_throttle(
+            1.0,
+            "[TwoOrderCBF] infeasible diag: %s | worst=%s:%s "
+            "gap=%.3f b=%.3f lhs_max=%.3f h=%.3f hdot=%.3f",
+            summary,
+            worst_meta.get("kind", "unknown"),
+            worst_meta.get("name", "?"),
+            float(gap[worst_idx]),
+            float(b[worst_idx]),
+            float(lhs_max[worst_idx]),
+            float(worst_meta.get("h", 0.0)),
+            float(worst_meta.get("hdot", 0.0)),
+        )
+
+    def _current_body_velocity_vector(self, all_dogs, states):
+        u_now = np.zeros(2 * len(all_dogs))
+        for idx, name in enumerate(all_dogs):
+            s = states[name]
+            if not s.received:
+                continue
+            u_now[2 * idx:2 * idx + 2] = rot2d(s.yaw).T @ s.vel_world
+        return self._clip_body_velocity_vector(u_now, len(all_dogs))
+
+    def _record_slack(self, eps, row_meta):
+        """記錄 HOCBF slack + 各類最小 h(實際安全距離),供 rqt_plot/debug。"""
+        mh = {}
+        for meta in row_meta:
+            k = meta.get("kind", "?")
+            if k.endswith("_v"):
+                continue
+            mh[k] = min(mh.get(k, 1e9), float(meta.get("h", 1e9)))
+        self.last_min_h_by_kind = mh
+        if eps is None or eps.value is None:
+            self.last_max_slack = 0.0
+            self.last_slack_by_kind = {}
+            return
+        eps_val = np.asarray(eps.value, dtype=float).ravel()
+        if eps_val.size == 0:
+            self.last_max_slack = 0.0
+            self.last_slack_by_kind = {}
+            return
+        self.last_max_slack = float(np.max(eps_val))
+        by_kind = {}
+        for i, meta in enumerate(row_meta):
+            if i >= eps_val.size:
+                break
+            kind = meta.get("kind", "?")
+            by_kind[kind] = max(by_kind.get(kind, 0.0), float(eps_val[i]))
+        self.last_slack_by_kind = by_kind
+        if self.last_max_slack > self.slack_warn_threshold:
+            rospy.logwarn_throttle(
+                1.0,
+                "[TwoOrderCBF] slack active: max eps=%.3f by kind=%s",
+                self.last_max_slack,
+                {k: round(v, 3) for k, v in by_kind.items()},
+            )
+
+    def _record_slack_array(self, eps_val, row_meta):
+        """multi-step 版: eps_val 為 numpy 陣列 (或 None),其餘同 _record_slack。"""
+        mh = {}
+        for meta in row_meta:
+            k = meta.get("kind", "?")
+            if k.endswith("_v"):
+                continue
+            mh[k] = min(mh.get(k, 1e9), float(meta.get("h", 1e9)))
+        self.last_min_h_by_kind = mh
+        if eps_val is None or len(eps_val) == 0:
+            self.last_max_slack = 0.0
+            self.last_slack_by_kind = {}
+            return
+        eps_val = np.asarray(eps_val, dtype=float).ravel()
+        self.last_max_slack = float(np.max(eps_val))
+        by_kind = {}
+        for i, meta in enumerate(row_meta):
+            if i >= eps_val.size:
+                break
+            kind = meta.get("kind", "?")
+            by_kind[kind] = max(by_kind.get(kind, 0.0), float(eps_val[i]))
+        self.last_slack_by_kind = by_kind
+        if self.last_max_slack > self.slack_warn_threshold:
+            rospy.logwarn_throttle(
+                1.0,
+                "[TwoOrderCBF] slack active: max eps=%.3f by kind=%s",
+                self.last_max_slack,
+                {k: round(v, 3) for k, v in by_kind.items()},
+            )
+
+    def _emergency_brake_result(self, all_dogs, u_now, n_dogs):
+        a_brake = -np.array(u_now, dtype=float) / self.emergency_brake_time
+        for idx in range(n_dogs):
+            x = 2 * idx
+            y = x + 1
+            a_brake[x] = max(-self.max_ax, min(self.max_ax, a_brake[x]))
+            a_brake[y] = max(-self.max_ay, min(self.max_ay, a_brake[y]))
+        self.last_accel_cmds = {
+            name: a_brake[2 * idx:2 * idx + 2].copy()
+            for idx, name in enumerate(all_dogs)
+        }
+        return {name: (0.0, 0.0) for name in all_dogs}
+
+    def _store_one_step_prediction(self, all_dogs, states, u_now, a_body, dt):
+        self.last_reference_paths = {}
+        self.last_prediction_paths = {}
+        self.last_prediction_dt = dt
+        for idx, name in enumerate(all_dogs):
+            s = states[name]
+            if not s.received:
+                continue
+            sl = slice(2 * idx, 2 * idx + 2)
+            R = rot2d(s.yaw)
+            dp_world = R @ (u_now[sl] * dt + 0.5 * a_body[sl] * dt * dt)
+            self.last_prediction_paths[name] = [
+                s.pos.copy(),
+                np.array(s.pos + dp_world, dtype=float),
+            ]
+
+    def solve(self, all_dogs, states, u_nominal, a_desired=None,
+              formation_grad=None, cbf_enabled=True, dt=0.05, yaw_rates=None):
+        if self.prediction_enabled and self.prediction_horizon > 1:
+            return self._solve_multistep_preview(
+                all_dogs, states, u_nominal,
+                a_desired=a_desired,
                 formation_grad=formation_grad,
                 cbf_enabled=cbf_enabled,
                 dt=dt,
+                yaw_rates=yaw_rates,
             )
-        return self._solve_multistep_preview(
+        return self._solve_single_step(
             all_dogs,
             states,
             u_nominal,
+            a_desired=a_desired,
             formation_grad=formation_grad,
             cbf_enabled=cbf_enabled,
             dt=dt,
+            yaw_rates=yaw_rates,
         )
 
-    def _solve_single_step(self, all_dogs, states, u_nominal, formation_grad=None,
-                           cbf_enabled=True, dt=0.05):
-        """
-        Parameters
-        ----------
-        all_dogs      : list[str]         狗名列表
-        states        : dict[str, RobotState]
-        u_nominal     : np.ndarray(2N,)   每隻狗的 nominal body-frame 速度
-        formation_grad: list[np.ndarray]  ∂f/∂p_i，world frame
-        dt            : float             QP single-step prediction horizon
-
-        Returns
-        -------
-        dict[str, (vx, vy)]               每隻狗的 body frame 安全速度
-        """
+    def _solve_single_step(self, all_dogs, states, u_nominal, a_desired=None,
+                           formation_grad=None, cbf_enabled=True, dt=0.05,
+                           yaw_rates=None):
         n_dogs = len(all_dogs)
         n_vars = 2 * n_dogs
         dog_idx = {name: i for i, name in enumerate(all_dogs)}
-        dt = max(0.0, float(dt))
+        dt = max(1e-6, float(dt))
+        R_dogs = {name: rot2d(states[name].yaw) for name in all_dogs}
+        u_now = self._current_body_velocity_vector(all_dogs, states)
+        u_nominal = self._clip_body_velocity_vector(u_nominal, n_dogs)
 
-        A_rows, b_rows = [], []
+        # Chain rule for body-frame acceleration:
+        #   v^W = R(psi) v^B
+        #   a^W = R(psi) [a^B + wz * [-vy^B, vx^B]^T]
+        # The first term R a^B stays in a_row as the QP unknown. The yaw term
+        # is known in the current cycle and is added to hddot_free.
+        if yaw_rates is None:
+            yaw_rates = {}
+        yaw_acc_world = {}
+        for idx, name in enumerate(all_dogs):
+            s = states[name]
+            sl = slice(2 * idx, 2 * idx + 2)
+            v_body = u_now[sl]
+            wz = float(yaw_rates.get(name, 0.0))
+            yaw_term_body = wz * np.array([-v_body[1], v_body[0]], dtype=float)
+            yaw_acc_world[name] = R_dogs[name] @ yaw_term_body
+
+        A_rows, b_rows, row_meta = [], [], []
 
         if cbf_enabled:
-            # ═══ 建構 CBF constraint（從舊版完整複製）═══
-            # ── Pairwise robot-robot CBF ──
+            # ── Pairwise robot-robot HOCBF ──
             for ia in range(n_dogs):
                 for ib in range(ia + 1, n_dogs):
                     na, nb = all_dogs[ia], all_dogs[ib]
@@ -1368,42 +1603,81 @@ class UnifiedQPController:
                     if not sa.received or not sb.received:
                         continue
                     dp = sa.pos - sb.pos
-                    h  = float(dp @ dp) - self.d_min_sq
+                    dv = sa.vel_world - sb.vel_world
+                    # 方向感知 dog-dog 間距：兩狗朝彼此方向的 footprint 投影相加。
+                    # 並排(過門 V_narrow)→ 小(~0.85，門過得了)；面對/交錯(場中機動)
+                    # → 大(身體+腿的真實間距)。base d_min 為下限。
+                    d_min_eff = max(
+                        self.d_min,
+                        self._footprint_support_along(dp, sa.yaw)
+                        + self._footprint_support_along(dp, sb.yaw))
+                    h = float(dp @ dp) - d_min_eff ** 2
+                    hdot = float(2.0 * dp @ dv)
+                    hddot_free = float(
+                        2.0 * dv @ dv
+                        + 2.0 * dp @ (yaw_acc_world[na] - yaw_acc_world[nb]))
                     a_row = np.zeros(n_vars)
                     col_a = 2 * dog_idx[na]
-                    a_row[col_a:col_a + 2] = 2.0 * dp @ rot2d(sa.yaw)
+                    a_row[col_a:col_a + 2] = 2.0 * dp @ R_dogs[na]
                     col_b = 2 * dog_idx[nb]
-                    a_row[col_b:col_b + 2] = -2.0 * dp @ rot2d(sb.yaw)
+                    a_row[col_b:col_b + 2] = -2.0 * dp @ R_dogs[nb]
                     A_rows.append(a_row)
-                    b_rows.append(-self.gamma_robot * h)
+                    b_rows.append(self._hocbf_rhs(
+                        h, hdot, hddot_free,
+                        self.gamma_robot_1, self.gamma_robot_2))
+                    row_meta.append({
+                        "kind": "pair",
+                        "name": "%s-%s" % (na, nb),
+                        "h": h,
+                        "hdot": hdot,
+                    })
 
-            # ── Obstacle CBF（predictive）──
+            # ── Circular obstacle HOCBF ──
             for obs in self.obstacles:
                 p_obs = np.array(obs["pos"][:2])
-                r_obs = float(obs["radius"])
+                r_base = float(obs["radius"])
+                r_phys = float(obs.get("physical_radius", 0.2))
                 for name in all_dogs:
                     s = states[name]
                     if not s.received:
                         continue
-                    p_pred = s.pos + s.vel_world * self.lookahead_tau
-                    dp     = p_pred - p_obs
-                    h_obs  = float(dp @ dp) - r_obs ** 2
-                    a_row  = np.zeros(n_vars)
-                    col    = 2 * dog_idx[name]
-                    a_row[col:col + 2] = 2.0 * dp @ rot2d(s.yaw)
+                    p_pred = s.pos
+                    dp = p_pred - p_obs
+                    # CBF 半徑要含「狗朝障礙方向的 footprint 投影」，否則只擋中心、
+                    # 狗鼻子(half_length 0.35 > 既有 buffer 0.30)會啃到障礙。
+                    # max(...) 確保不低於原本 radius，只在正面接近時加餘量。
+                    r_obs = max(
+                        r_base,
+                        r_phys + self._footprint_support_along(dp, s.yaw))
+                    h_obs = float(dp @ dp) - r_obs ** 2
+                    hdot = float(2.0 * dp @ s.vel_world)
+                    hddot_free = float(
+                        2.0 * s.vel_world @ s.vel_world
+                        + 2.0 * dp @ yaw_acc_world[name])
+                    a_row = np.zeros(n_vars)
+                    col = 2 * dog_idx[name]
+                    a_row[col:col + 2] = 2.0 * dp @ R_dogs[name]
                     A_rows.append(a_row)
-                    b_rows.append(-self.gamma_obs * h_obs)
+                    b_rows.append(self._hocbf_rhs(
+                        h_obs, hdot, hddot_free,
+                        self.gamma_obs_1, self.gamma_obs_2))
+                    row_meta.append({
+                        "kind": "obs",
+                        "name": str(obs.get("pos", "?")),
+                        "h": h_obs,
+                        "hdot": hdot,
+                    })
 
-            # ── Rect obstacle CBF（有洞口的牆段）──
+            # ── Rect obstacle HOCBF（有洞口的牆段）──
             for rect in self.rect_obstacles:
                 center = np.array(rect["center"][:2], dtype=float)
                 size   = np.array(rect["size"][:2], dtype=float)
-                d_safe = float(rect.get("d_safe", 0.35))
+                d_safe_base = float(rect.get("d_safe", 0.35))
                 for name in all_dogs:
                     s = states[name]
                     if not s.received:
                         continue
-                    p_pred    = s.pos + s.vel_world * self.lookahead_tau
+                    p_pred    = s.pos
                     p_closest = closest_point_on_aabb(p_pred, center, size)
                     dp   = p_pred - p_closest
                     dist = float(np.linalg.norm(dp))
@@ -1423,14 +1697,30 @@ class UnifiedQPController:
                             else:
                                 dp = np.array([0.0, math.copysign(1.0, away[1] or 1.0)])
                         dist = 0.0
+                    # 門牆同樣加 footprint 投影（正面接近才加餘量，側向通過維持原 d_safe）。
+                    d_safe = max(
+                        d_safe_base,
+                        self._footprint_support_along(dp, s.yaw))
                     h_rect = dist ** 2 - d_safe ** 2
+                    hdot = float(2.0 * dp @ s.vel_world)
+                    hddot_free = float(
+                        2.0 * s.vel_world @ s.vel_world
+                        + 2.0 * dp @ yaw_acc_world[name])
                     a_row = np.zeros(n_vars)
                     col = 2 * dog_idx[name]
-                    a_row[col:col + 2] = 2.0 * dp @ rot2d(s.yaw)
+                    a_row[col:col + 2] = 2.0 * dp @ R_dogs[name]
                     A_rows.append(a_row)
-                    b_rows.append(-self.gamma_obs * h_rect)
+                    b_rows.append(self._hocbf_rhs(
+                        h_rect, hdot, hddot_free,
+                        self.gamma_obs_1, self.gamma_obs_2))
+                    row_meta.append({
+                        "kind": "rect",
+                        "name": str(rect.get("center", "?")),
+                        "h": h_rect,
+                        "hdot": hdot,
+                    })
 
-            # ── Wall CBF（predictive）──
+            # ── Wall HOCBF ──
             for wall in self.walls:
                 n_w    = np.array(wall["normal"][:2], dtype=float)
                 p_w    = np.array(wall["point"][:2],  dtype=float)
@@ -1443,30 +1733,41 @@ class UnifiedQPController:
                         d_safe_base,
                         self._footprint_support_along(n_w, s.yaw),
                     )
-                    p_pred = s.pos + s.vel_world * self.lookahead_tau
+                    p_pred = s.pos
                     h_wall = float(n_w @ (p_pred - p_w)) - d_safe
+                    hdot = float(n_w @ s.vel_world)
                     a_row  = np.zeros(n_vars)
                     col    = 2 * dog_idx[name]
-                    a_row[col:col + 2] = n_w @ rot2d(s.yaw)
+                    a_row[col:col + 2] = n_w @ R_dogs[name]
                     A_rows.append(a_row)
-                    b_rows.append(-self.gamma_wall * h_wall)
+                    hddot_free = float(n_w @ yaw_acc_world[name])
+                    b_rows.append(self._hocbf_rhs(
+                        h_wall, hdot, hddot_free,
+                        self.gamma_wall_1, self.gamma_wall_2))
+                    row_meta.append({
+                        "kind": "wall",
+                        "name": str(wall.get("normal", "?")),
+                        "h": h_wall,
+                        "hdot": hdot,
+                    })
 
-        # ═══ 建構 QP objective（升級部分）═══
-        u = cp.Variable(n_vars)
+            # 純二階 HOCBF：不再額外加入速度層 CBF constraint。
 
-        # (a) Nominal tracking: 每隻狗追 virtual-center formation target
-        u_nominal = np.array(u_nominal, dtype=float)
+        # ═══ 建構 acceleration QP objective ═══
+        a = cp.Variable(n_vars)
+        u_next = u_now + dt * a
 
-        tracking_terms = []
-        for idx, _ in enumerate(all_dogs):
-            sl = slice(2 * idx, 2 * idx + 2)
-            tracking_terms.append(cp.sum_squares(u[sl] - u_nominal[sl]))
-        cost_tracking = self.w_track * (
-            sum(tracking_terms) if tracking_terms else 0.0
-        )
+        # a_d: position error -> desired acceleration (body frame)
+        if a_desired is not None:
+            a_d = np.array(a_desired, dtype=float)
+        else:
+            # fallback: derive an acceleration reference from velocity error.
+            a_d = (u_nominal - u_now) / dt
 
-        # (b) Laplacian formation cost from first-order Taylor expansion:
-        # f(p + R_i u_i dt) ~= f(p) + grad_f_i^T R_i u_i dt.
+        cost_tracking = self.w_track * cp.sum_squares(a - a_d)
+
+        # f(p + R_i (u_now dt + 0.5 a_i dt²))
+        # ~= const + grad_f_i^T R_i (0.5 a_i dt²).
         cost_formation_linear = 0.0
         if (self.w_formation > 1e-9
                 and formation_grad is not None
@@ -1478,60 +1779,84 @@ class UnifiedQPController:
                     continue
                 grad_world = np.array(formation_grad[idx], dtype=float)
                 g_vec[2 * idx:2 * idx + 2] = (
-                    grad_world @ rot2d(s.yaw)) * dt
-            cost_formation_linear = self.w_formation * (g_vec @ u)
+                    grad_world @ R_dogs[name]) * (0.5 * dt * dt)
+            cost_formation_linear = self.w_formation * (g_vec @ a)
 
-        # (c) 正則項: w_reg · ‖u‖²（防止線性項讓速度發散）
-        cost_reg = self.w_reg * cp.sum_squares(u)
+        cost_accel = self.w_accel * cp.sum_squares(a)
 
-        # (d) Slack（從舊版完整保留）
-        objective_terms = [cost_tracking, cost_formation_linear, cost_reg]
+        objective_terms = [
+            cost_tracking,
+            cost_formation_linear,
+            cost_accel,
+        ]
         constraints = []
-        eps = None
 
         for idx in range(n_dogs):
+            ax = a[2 * idx]
+            ay = a[2 * idx + 1]
+            vx_next = u_next[2 * idx]
+            vy_next = u_next[2 * idx + 1]
             constraints += [
-                u[2 * idx]     <= self.max_vx,
-                u[2 * idx]     >= -self.max_vx,
-                u[2 * idx + 1] <= self.max_vy,
-                u[2 * idx + 1] >= -self.max_vy,
+                ax <= self.max_ax,
+                ax >= -self.max_ax,
+                ay <= self.max_ay,
+                ay >= -self.max_ay,
+                vx_next <= self.max_vx,
+                vx_next >= -self.max_vx,
+                vy_next <= self.max_vy,
+                vy_next >= -self.max_vy,
             ]
 
+        eps = None
         if A_rows:
             A = np.array(A_rows)
             b = np.array(b_rows)
-            eps = cp.Variable(A.shape[0], nonneg=True)
-            constraints.append(A @ u >= b - eps)
-            objective_terms.append(self.slack_lambda * cp.sum_squares(eps))
+            if self.slack_enabled:
+                # Soft HOCBF: A·a >= b - ε, ε>=0, 重罰 λ‖ε‖²。
+                # 可行時 ε=0 → 嚴格 CBF；窄處 infeasible 時取最小違反，不卡死。
+                eps = cp.Variable(A.shape[0], nonneg=True)
+                constraints.append(A @ a >= b - eps)
+                objective_terms.append(self.slack_lambda * cp.sum_squares(eps))
+            else:
+                # 硬 CBF（驗證用，無 slack）：不可行 → QP fail → emergency brake。
+                # 此模式下 h≥0 才是真正的安全保證,可用 /cbf_debug/h_min_* 確認。
+                constraints.append(A @ a >= b)
 
         prob = cp.Problem(cp.Minimize(sum(objective_terms)), constraints)
 
         try:
             prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
         except cp.SolverError:
-            rospy.logwarn("[UnifiedQP] Solver error, returning zero")
-            self.last_max_slack = float('inf')
-            return {name: (0.0, 0.0) for name in all_dogs}
+            rospy.logwarn(
+                "[TwoOrderCBF] Solver error, emergency braking")
+            self.last_cbf_status = "solver_error"
+            return self._emergency_brake_result(all_dogs, u_now, n_dogs)
 
         if prob.status not in ("optimal", "optimal_inaccurate"):
-            rospy.logwarn("[UnifiedQP] QP status=%s, returning zero", prob.status)
-            self.last_max_slack = float('inf')
-            return {name: (0.0, 0.0) for name in all_dogs}
+            rospy.logwarn(
+                "[TwoOrderCBF] QP status=%s, emergency braking", prob.status)
+            self._log_hocbf_infeasible_diagnostics(
+                A_rows, b_rows, row_meta, u_now, dt, n_dogs)
+            self.last_cbf_status = str(prob.status)
+            return self._emergency_brake_result(all_dogs, u_now, n_dogs)
 
-        if eps is not None and eps.value is not None:
-            self.last_max_slack = float(np.max(eps.value))
-            if self.last_max_slack > self.slack_warn_threshold:
-                rospy.logwarn_throttle(
-                    1.0,
-                    "[UnifiedQP] slack active, max ε=%.3f",
-                    self.last_max_slack,
-                )
-        else:
-            self.last_max_slack = 0.0
+        self.last_cbf_status = str(prob.status)
+        self._record_slack(eps, row_meta)
 
-        u_sol = u.value
-        return {name: (float(u_sol[2 * dog_idx[name]]),
-                       float(u_sol[2 * dog_idx[name] + 1]))
+        a_sol = np.array(a.value, dtype=float)
+        self._last_a_sol = a_sol.copy()
+        u_next_sol = self._clip_body_velocity_vector(
+            u_now + dt * a_sol, n_dogs)
+        effective_a = (u_next_sol - u_now) / dt
+        self.last_accel_cmds = {
+            name: effective_a[2 * dog_idx[name]:2 * dog_idx[name] + 2].copy()
+            for name in all_dogs
+        }
+        self._store_one_step_prediction(
+            all_dogs, states, u_now, effective_a, dt)
+
+        return {name: (float(u_next_sol[2 * dog_idx[name]]),
+                       float(u_next_sol[2 * dog_idx[name] + 1]))
                 for name in all_dogs}
 
     def _prediction_step_dt(self, dt):
@@ -1569,90 +1894,173 @@ class UnifiedQPController:
         return paths
 
     def _solve_multistep_preview(self, all_dogs, states, u_nominal,
-                                 formation_grad=None, cbf_enabled=True,
-                                 dt=0.05):
-        """
-        Preview multi-step CBF-QP.
+                                 a_desired=None, formation_grad=None,
+                                 cbf_enabled=True, dt=0.05, yaw_rates=None):
+        """二階 multi-step preview HOCBF-QP。
 
-        Future CBF/Laplacian rows are built around a fixed reference rollout
-        from the previous horizon solution. The QP still decides the whole
-        velocity sequence and publishes only the first step.
+        決策變數: 整段 body-frame 加速度序列 A = [a_0, a_1, ..., a_{N-1}],
+        每個 a_k 是 2*n_dogs 維。只發布第一步 a_0。
+
+        參考軌跡 (reference rollout): 用上一輪解 shift 一格當參考,沿參考的
+        body 速度做二次位置外推:
+            v_k^B = v_{k-1}^B + a_k^ref * dt        (參考加速度)
+            p_k^W = p_{k-1}^W + R v_{k-1}^B dt + 1/2 R a_k^ref dt^2
+        未來各步的 HOCBF row 在這些參考點 (p_k, v_k) 上線性化:
+            hddot + (g1+g2) hdot + g1 g2 h >= 0
+        其中決策變數 a_k 只進 hddot 的 a 項 (2 dp^T R a_k),
+        hdot/h 用參考量 (已知常數)。w_smooth 綁相鄰 a_k,把未來趨勢回傳 a_0。
+
+        維持無 slack 硬約束 (slack_enabled 控制),不可行則 emergency brake。
+        WBC 介面 / cmd_vel 介面不變: 仍只用第一步 a_0。
         """
         n_dogs = len(all_dogs)
-        n_per_step = 2 * n_dogs
+        n_per = 2 * n_dogs
         n_steps = max(2, int(self.prediction_horizon))
-        n_total = n_per_step * n_steps
+        n_total = n_per * n_steps
         dog_idx = {name: i for i, name in enumerate(all_dogs)}
+        dt = max(1e-6, float(dt))
         dt_pred = self._prediction_step_dt(dt)
 
+        # 冷啟動: 還沒有暖啟動序列時,第一輪先用 single-step 解 (穩且能立即
+        # 產生合理 a_0),並把它擴成整段序列存入暖啟動,下一輪起才真正跑
+        # horizon preview。避免冷啟動參考軌跡不準導致第一次無謂 brake。
+        if self._last_A_seq is None or len(self._last_A_seq) != n_total:
+            res = self._solve_single_step(
+                all_dogs, states, u_nominal, a_desired=a_desired,
+                formation_grad=formation_grad, cbf_enabled=cbf_enabled,
+                dt=dt, yaw_rates=yaw_rates)
+            if self._last_a_sol is not None and len(self._last_a_sol) == n_per:
+                self._last_A_seq = np.tile(self._last_a_sol, n_steps)
+            return res
+
         R_dogs = {name: rot2d(states[name].yaw) for name in all_dogs}
+        u_now = self._current_body_velocity_vector(all_dogs, states)
         u_nominal = self._clip_body_velocity_vector(u_nominal, n_dogs)
 
-        if self._last_V_sol is not None and len(self._last_V_sol) == n_total:
-            nom_seq = np.concatenate([
-                self._last_V_sol[n_per_step:], u_nominal
+        if yaw_rates is None:
+            yaw_rates = {}
+
+        # a_desired (body frame) for tracking; 沿 horizon 重複使用第一步 ref。
+        if a_desired is not None:
+            a_d0 = np.array(a_desired, dtype=float)
+        else:
+            a_d0 = (u_nominal - u_now) / dt_pred
+
+        # ── 參考加速度序列 (暖啟動: 上一輪解 shift 一格, 末步補 a_d0) ──
+        # 注意: 第一輪沒有暖啟動時,不能用「固定衝刺加速度」外推,否則參考
+        # 軌跡會直直穿進障礙,使遠期 HOCBF row 要求過量煞車而整段 infeasible。
+        # fallback 改用「零加速度」(等速滑行) 當保守參考,讓第一輪能解出來,
+        # 之後的 cycle 再靠暖啟動 (上一輪會減速的解) 自然收斂。
+        if self._last_A_seq is not None and len(self._last_A_seq) == n_total:
+            a_ref_seq = np.concatenate([
+                self._last_A_seq[n_per:], self._last_A_seq[-n_per:]
             ])
         else:
-            nom_seq = np.tile(u_nominal, n_steps)
-        nom_seq = self._clip_body_velocity_sequence(
-            nom_seq, n_dogs, n_steps)
-        p_nom = self._rollout_prediction_paths(
-            all_dogs, states, nom_seq, R_dogs, dt_pred, n_steps)
+            a_ref_seq = np.zeros(n_total)
 
-        A_rows, b_rows = [], []
+        # ── 沿參考序列 rollout: 每步每狗的參考位置 p_k^W 與參考速度 v_k^W ──
+        # p_ref[name] = [p_0, p_1, ..., p_{N-1}] (world)
+        # v_ref[name] = [v_0, v_1, ..., v_{N-1}] (world)
+        p_ref = {name: [states[name].pos.copy()] for name in all_dogs}
+        v_ref_body = {name: [u_now[2 * dog_idx[name]:2 * dog_idx[name] + 2].copy()]
+                      for name in all_dogs}
+        v_ref_world = {name: [states[name].vel_world.copy()] for name in all_dogs}
+        for k in range(1, n_steps):
+            for name in all_dogs:
+                i = dog_idx[name]
+                R = R_dogs[name]
+                a_k_body = a_ref_seq[(k - 1) * n_per + 2 * i:
+                                     (k - 1) * n_per + 2 * i + 2]
+                v_prev_body = v_ref_body[name][-1]
+                p_prev = p_ref[name][-1]
+                # 二次位置外推 (yaw 固定為當前, body frame 線性化)
+                dp_world = R @ (v_prev_body * dt_pred
+                                + 0.5 * a_k_body * dt_pred * dt_pred)
+                p_new = p_prev + dp_world
+                v_new_body = v_prev_body + a_k_body * dt_pred
+                v_new_world = R @ v_new_body
+                p_ref[name].append(p_new)
+                v_ref_body[name].append(v_new_body)
+                v_ref_world[name].append(v_new_world)
 
+        A_rows, b_rows, row_meta = [], [], []
+
+        # row 全部建立並以 "step" 標記; 組裝時 k==0 進硬約束 (無 slack 嚴格
+        # 保證), k>=1 進軟性 cost (預警, 不製造 infeasible)。
         if cbf_enabled:
             for k in range(n_steps):
-                col_offset = k * n_per_step
+                col_off = k * n_per
 
-                # Pairwise robot-robot CBF.
+                # ── Pairwise robot-robot HOCBF ──
                 for ia in range(n_dogs):
                     for ib in range(ia + 1, n_dogs):
                         na, nb = all_dogs[ia], all_dogs[ib]
                         sa, sb = states[na], states[nb]
                         if not sa.received or not sb.received:
                             continue
-                        dp = p_nom[na][k] - p_nom[nb][k]
-                        h = float(dp @ dp) - self.d_min_sq
+                        dp = p_ref[na][k] - p_ref[nb][k]
+                        dv = v_ref_world[na][k] - v_ref_world[nb][k]
+                        d_min_eff = max(
+                            self.d_min,
+                            self._footprint_support_along(dp, sa.yaw)
+                            + self._footprint_support_along(dp, sb.yaw))
+                        h = float(dp @ dp) - d_min_eff ** 2
+                        hdot = float(2.0 * dp @ dv)
+                        # hddot_free: 參考速度的 2|dv|^2 (yaw 項在 preview 忽略)
+                        hddot_free = float(2.0 * dv @ dv)
                         a_row = np.zeros(n_total)
-                        col_a = col_offset + 2 * dog_idx[na]
-                        a_row[col_a:col_a + 2] = 2.0 * dp @ R_dogs[na]
-                        col_b = col_offset + 2 * dog_idx[nb]
-                        a_row[col_b:col_b + 2] = -2.0 * dp @ R_dogs[nb]
+                        ca = col_off + 2 * dog_idx[na]
+                        a_row[ca:ca + 2] = 2.0 * dp @ R_dogs[na]
+                        cb = col_off + 2 * dog_idx[nb]
+                        a_row[cb:cb + 2] = -2.0 * dp @ R_dogs[nb]
                         A_rows.append(a_row)
-                        b_rows.append(-self.gamma_robot * h)
+                        b_rows.append(self._hocbf_rhs(
+                            h, hdot, hddot_free,
+                            self.gamma_robot_1, self.gamma_robot_2))
+                        row_meta.append({"kind": "pair", "step": k,
+                                         "name": "%s-%s" % (na, nb),
+                                         "h": h, "hdot": hdot})
 
-                # Circular obstacle CBF.
+                # ── Circular obstacle HOCBF ──
                 for obs in self.obstacles:
                     p_obs = np.array(obs["pos"][:2])
-                    r_obs = float(obs["radius"])
+                    r_base = float(obs["radius"])
+                    r_phys = float(obs.get("physical_radius", 0.2))
                     for name in all_dogs:
                         s = states[name]
                         if not s.received:
                             continue
-                        pk = p_nom[name][k].copy()
-                        if k == 0:
-                            pk = pk + s.vel_world * self.lookahead_tau
+                        pk = p_ref[name][k]
+                        vk = v_ref_world[name][k]
                         dp = pk - p_obs
+                        r_obs = max(
+                            r_base,
+                            r_phys + self._footprint_support_along(dp, s.yaw))
                         h_obs = float(dp @ dp) - r_obs ** 2
+                        hdot = float(2.0 * dp @ vk)
+                        hddot_free = float(2.0 * vk @ vk)
                         a_row = np.zeros(n_total)
-                        col = col_offset + 2 * dog_idx[name]
+                        col = col_off + 2 * dog_idx[name]
                         a_row[col:col + 2] = 2.0 * dp @ R_dogs[name]
                         A_rows.append(a_row)
-                        b_rows.append(-self.gamma_obs * h_obs)
+                        b_rows.append(self._hocbf_rhs(
+                            h_obs, hdot, hddot_free,
+                            self.gamma_obs_1, self.gamma_obs_2))
+                        row_meta.append({"kind": "obs", "step": k,
+                                         "name": str(obs.get("pos", "?")),
+                                         "h": h_obs, "hdot": hdot})
 
-                # Rect obstacle CBF.
+                # ── Rect obstacle HOCBF ──
                 for rect in self.rect_obstacles:
                     center = np.array(rect["center"][:2], dtype=float)
                     size = np.array(rect["size"][:2], dtype=float)
-                    d_safe = float(rect.get("d_safe", 0.35))
+                    d_safe_base = float(rect.get("d_safe", 0.35))
                     for name in all_dogs:
                         s = states[name]
                         if not s.received:
                             continue
-                        pk = p_nom[name][k].copy()
-                        if k == 0:
-                            pk = pk + s.vel_world * self.lookahead_tau
+                        pk = p_ref[name][k]
+                        vk = v_ref_world[name][k]
                         p_closest = closest_point_on_aabb(pk, center, size)
                         dp = pk - p_closest
                         dist = float(np.linalg.norm(dp))
@@ -1661,31 +2069,34 @@ class UnifiedQPController:
                             if escape is not None:
                                 dp = np.array(escape[:2], dtype=float)
                                 norm = float(np.linalg.norm(dp))
-                                if norm < 1e-9:
-                                    dp = np.zeros(2)
-                                else:
-                                    dp = dp / norm
+                                dp = dp / norm if norm > 1e-9 else np.zeros(2)
                             if float(np.linalg.norm(dp)) < 1e-9:
                                 away = pk - center
                                 if abs(away[0]) > abs(away[1]):
-                                    dp = np.array([
-                                        math.copysign(1.0, away[0] or 1.0),
-                                        0.0,
-                                    ])
+                                    dp = np.array(
+                                        [math.copysign(1.0, away[0] or 1.0), 0.0])
                                 else:
-                                    dp = np.array([
-                                        0.0,
-                                        math.copysign(1.0, away[1] or 1.0),
-                                    ])
+                                    dp = np.array(
+                                        [0.0, math.copysign(1.0, away[1] or 1.0)])
                             dist = 0.0
+                        d_safe = max(
+                            d_safe_base,
+                            self._footprint_support_along(dp, s.yaw))
                         h_rect = dist ** 2 - d_safe ** 2
+                        hdot = float(2.0 * dp @ vk)
+                        hddot_free = float(2.0 * vk @ vk)
                         a_row = np.zeros(n_total)
-                        col = col_offset + 2 * dog_idx[name]
+                        col = col_off + 2 * dog_idx[name]
                         a_row[col:col + 2] = 2.0 * dp @ R_dogs[name]
                         A_rows.append(a_row)
-                        b_rows.append(-self.gamma_obs * h_rect)
+                        b_rows.append(self._hocbf_rhs(
+                            h_rect, hdot, hddot_free,
+                            self.gamma_obs_1, self.gamma_obs_2))
+                        row_meta.append({"kind": "rect", "step": k,
+                                         "name": str(rect.get("center", "?")),
+                                         "h": h_rect, "hdot": hdot})
 
-                # Wall CBF.
+                # ── Wall HOCBF ──
                 for wall in self.walls:
                     n_w = np.array(wall["normal"][:2], dtype=float)
                     p_w = np.array(wall["point"][:2], dtype=float)
@@ -1694,123 +2105,169 @@ class UnifiedQPController:
                         s = states[name]
                         if not s.received:
                             continue
+                        pk = p_ref[name][k]
+                        vk = v_ref_world[name][k]
                         d_safe = max(
                             d_safe_base,
-                            self._footprint_support_along(n_w, s.yaw),
-                        )
-                        pk = p_nom[name][k].copy()
-                        if k == 0:
-                            pk = pk + s.vel_world * self.lookahead_tau
+                            self._footprint_support_along(n_w, s.yaw))
                         h_wall = float(n_w @ (pk - p_w)) - d_safe
+                        hdot = float(n_w @ vk)
+                        hddot_free = 0.0
                         a_row = np.zeros(n_total)
-                        col = col_offset + 2 * dog_idx[name]
+                        col = col_off + 2 * dog_idx[name]
                         a_row[col:col + 2] = n_w @ R_dogs[name]
                         A_rows.append(a_row)
-                        b_rows.append(-self.gamma_wall * h_wall)
+                        b_rows.append(self._hocbf_rhs(
+                            h_wall, hdot, hddot_free,
+                            self.gamma_wall_1, self.gamma_wall_2))
+                        row_meta.append({"kind": "wall", "step": k,
+                                         "name": str(wall.get("normal", "?")),
+                                         "h": h_wall, "hdot": hdot})
 
-        V = cp.Variable(n_total)
+        # ═══ QP objective ═══
+        A = cp.Variable(n_total)
         objective_terms = []
 
-        tracking_terms = []
-        for idx in range(n_dogs):
-            sl = slice(2 * idx, 2 * idx + 2)
-            tracking_terms.append(cp.sum_squares(V[sl] - u_nominal[sl]))
-        objective_terms.append(
-            self.w_track * (sum(tracking_terms) if tracking_terms else 0.0)
-        )
+        # tracking: 只對第一步 a_0 追 a_desired (其餘步交給 smooth 連動)
+        sl0 = slice(0, n_per)
+        objective_terms.append(self.w_track * cp.sum_squares(A[sl0] - a_d0))
 
+        # formation linear cost: 只加在第一步 (與 single-step 一致)
         if (self.w_formation > 1e-9
                 and formation_grad is not None
                 and len(formation_grad) == n_dogs):
-            for k in range(n_steps):
-                if k == 0 or self.laplacian_ref is None:
-                    grad_k = formation_grad
-                else:
-                    positions_k = [p_nom[name][k] for name in all_dogs]
-                    _, grad_k = self.laplacian_ref.compute(positions_k)
+            g_vec = np.zeros(n_per)
+            for idx, name in enumerate(all_dogs):
+                s = states[name]
+                if not s.received:
+                    continue
+                grad_world = np.array(formation_grad[idx], dtype=float)
+                g_vec[2 * idx:2 * idx + 2] = (
+                    grad_world @ R_dogs[name]) * (0.5 * dt_pred * dt_pred)
+            objective_terms.append(self.w_formation * (g_vec @ A[sl0]))
 
-                g_vec = np.zeros(n_per_step)
-                for idx, name in enumerate(all_dogs):
-                    s = states[name]
-                    if not s.received:
-                        continue
-                    grad_world = np.array(grad_k[idx], dtype=float)
-                    g_vec[2 * idx:2 * idx + 2] = (
-                        grad_world @ R_dogs[name]) * dt_pred
+        # accel regularization: 整段
+        objective_terms.append(self.w_accel * cp.sum_squares(A))
 
-                sl_k = slice(k * n_per_step, (k + 1) * n_per_step)
-                objective_terms.append(self.w_formation * (g_vec @ V[sl_k]))
-
-        objective_terms.append(self.w_reg * cp.sum_squares(V))
-
-        if n_steps > 1 and self.w_smooth > 0.0:
+        # smooth: 綁相鄰步加速度,把未來趨勢回傳第一步
+        if self.w_smooth > 0.0:
             for k in range(n_steps - 1):
-                sl_k = slice(k * n_per_step, (k + 1) * n_per_step)
-                sl_k1 = slice((k + 1) * n_per_step,
-                              (k + 2) * n_per_step)
+                slk = slice(k * n_per, (k + 1) * n_per)
+                slk1 = slice((k + 1) * n_per, (k + 2) * n_per)
                 objective_terms.append(
-                    self.w_smooth * cp.sum_squares(V[sl_k1] - V[sl_k])
-                )
+                    self.w_smooth * cp.sum_squares(A[slk1] - A[slk]))
 
+        # ═══ bounds: 每步加速度上限 + 累積速度上限 (沿參考速度) ═══
         constraints = []
         for k in range(n_steps):
             for idx in range(n_dogs):
-                base = k * n_per_step + 2 * idx
-                constraints += [
-                    V[base] <= self.max_vx,
-                    V[base] >= -self.max_vx,
-                    V[base + 1] <= self.max_vy,
-                    V[base + 1] >= -self.max_vy,
-                ]
+                ax = A[k * n_per + 2 * idx]
+                ay = A[k * n_per + 2 * idx + 1]
+                constraints += [ax <= self.max_ax, ax >= -self.max_ax,
+                                ay <= self.max_ay, ay >= -self.max_ay]
+                # 第一步: 速度上限用真實 u_now 約束 v_next
+                if k == 0:
+                    vx_next = u_now[2 * idx] + dt_pred * ax
+                    vy_next = u_now[2 * idx + 1] + dt_pred * ay
+                    constraints += [
+                        vx_next <= self.max_vx, vx_next >= -self.max_vx,
+                        vy_next <= self.max_vy, vy_next >= -self.max_vy]
 
+        # ═══ CBF row 依 step 分流 ═══
+        #   k==0 (當前真實狀態): 硬約束 A0·a >= b0
+        #       - slack_enabled=False → 純硬 CBF, 嚴格保證 (教授要的)
+        #       - slack_enabled=True  → 軟化 (相容舊行為)
+        #   k>=1 (預測步): 軟性 cost w_pred * relu(b - A·a)^2
+        #       未來約束滿足時不罰; 違反時溫和拉回, 把減速趨勢回傳第一步。
+        #       cost 永遠可行, 不會像硬約束那樣製造 infeasible。
         eps = None
-        if A_rows:
-            A = np.array(A_rows)
-            b = np.array(b_rows)
-            eps = cp.Variable(A.shape[0], nonneg=True)
-            constraints.append(A @ V >= b - eps)
-            objective_terms.append(self.slack_lambda * cp.sum_squares(eps))
+        hard_idx = [i for i, m in enumerate(row_meta)
+                    if m.get("step", 0) == 0]
+        soft_idx = [i for i, m in enumerate(row_meta)
+                    if m.get("step", 0) != 0]
+
+        if hard_idx:
+            A_hard = np.array([A_rows[i] for i in hard_idx])
+            b_hard = np.array([b_rows[i] for i in hard_idx])
+            if self.slack_enabled:
+                eps = cp.Variable(A_hard.shape[0], nonneg=True)
+                constraints.append(A_hard @ A >= b_hard - eps)
+                objective_terms.append(
+                    self.slack_lambda * cp.sum_squares(eps))
+            else:
+                constraints.append(A_hard @ A >= b_hard)
+
+        if soft_idx:
+            A_soft = np.array([A_rows[i] for i in soft_idx])
+            b_soft = np.array([b_rows[i] for i in soft_idx])
+            # 違反量 viol = max(0, b - A·a); cost = w_pred * sum(viol^2)
+            # 用溫和權重 (非 slack_lambda 的 1e4): 太大會讓遠期軟約束變回硬性、
+            # 重新製造 infeasible 的傾向; 太小則前瞻減速不夠。w_pred~5~50 合適。
+            w_pred = float(getattr(self, "w_pred", 20.0))
+            viol = cp.pos(b_soft - A_soft @ A)
+            objective_terms.append(w_pred * cp.sum_squares(viol))
 
         prob = cp.Problem(cp.Minimize(sum(objective_terms)), constraints)
 
         try:
             prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
         except cp.SolverError:
-            rospy.logwarn("[UnifiedQP] Solver error, returning zero")
-            self.last_max_slack = float('inf')
+            rospy.logwarn("[TwoOrderCBF] Solver error (multistep), braking")
+            self.last_cbf_status = "solver_error"
             self.reset_prediction("solver error")
-            return {name: (0.0, 0.0) for name in all_dogs}
+            return self._emergency_brake_result(all_dogs, u_now, n_dogs)
 
         if prob.status not in ("optimal", "optimal_inaccurate"):
-            rospy.logwarn("[UnifiedQP] QP status=%s, returning zero",
-                          prob.status)
-            self.last_max_slack = float('inf')
+            rospy.logwarn(
+                "[TwoOrderCBF] QP status=%s (multistep), braking", prob.status)
+            # 用 step==0 標記精確抓第一步 row、只取前 n_per 欄,維度對得上 u_now
+            first_idx = [i for i, m in enumerate(row_meta)
+                         if m.get("step", 0) == 0]
+            if first_idx:
+                A_first = [A_rows[i][:n_per] for i in first_idx]
+                b_first = [b_rows[i] for i in first_idx]
+                m_first = [row_meta[i] for i in first_idx]
+                self._log_hocbf_infeasible_diagnostics(
+                    A_first, b_first, m_first, u_now, dt_pred, n_dogs)
+            self.last_cbf_status = str(prob.status)
             self.reset_prediction("non-optimal status")
-            return {name: (0.0, 0.0) for name in all_dogs}
+            return self._emergency_brake_result(all_dogs, u_now, n_dogs)
 
+        self.last_cbf_status = str(prob.status)
+        A_sol = np.array(A.value, dtype=float)
+        self._last_A_seq = A_sol.copy()
+
+        # 只取第一步
+        a_first = A_sol[:n_per]
+        self._last_a_sol = a_first.copy()
+
+        # slack 記錄: 只看第一步那段 row (step==0)
+        first_idx = [i for i, m in enumerate(row_meta)
+                     if m.get("step", 0) == 0]
+        m_first = [row_meta[i] for i in first_idx]
         if eps is not None and eps.value is not None:
-            self.last_max_slack = float(np.max(eps.value))
-            if self.last_max_slack > self.slack_warn_threshold:
-                rospy.logwarn_throttle(
-                    1.0,
-                    "[UnifiedQP] slack active, max ε=%.3f (N=%d)",
-                    self.last_max_slack,
-                    n_steps,
-                )
+            eps_arr = np.asarray(eps.value, dtype=float).ravel()
+            eps_first = [eps_arr[i] for i in first_idx if i < eps_arr.size]
+            self._record_slack_array(np.array(eps_first), m_first)
         else:
-            self.last_max_slack = 0.0
+            self._record_slack_array(None, m_first)
 
-        V_sol = np.array(V.value, dtype=float)
-        self._last_V_sol = V_sol.copy()
-        self.last_reference_paths = p_nom
-        self.last_prediction_paths = self._rollout_prediction_paths(
-            all_dogs, states, V_sol, R_dogs, dt_pred, n_steps)
-        self.last_prediction_dt = dt_pred
+        u_next_sol = self._clip_body_velocity_vector(
+            u_now + dt_pred * a_first, n_dogs)
+        effective_a = (u_next_sol - u_now) / dt_pred
+        self.last_accel_cmds = {
+            name: effective_a[2 * dog_idx[name]:2 * dog_idx[name] + 2].copy()
+            for name in all_dogs
+        }
+        self._store_one_step_prediction(
+            all_dogs, states, u_now, effective_a, dt_pred)
 
-        v0 = V_sol[:n_per_step]
-        return {name: (float(v0[2 * dog_idx[name]]),
-                       float(v0[2 * dog_idx[name] + 1]))
+        return {name: (float(u_next_sol[2 * dog_idx[name]]),
+                       float(u_next_sol[2 * dog_idx[name] + 1]))
                 for name in all_dogs}
+
+
+UnifiedQPController = TwoOrderCBFQPController
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1854,6 +2311,63 @@ class CmdVelPublisher:
             self._pubs[name].publish(zero)
 
 
+class AccelCmdPublisher:
+    def __init__(self, all_dog_names, scale=1.0):
+        self._pubs = {
+            name: rospy.Publisher(f"/{name}/accel_cmd", Vector3, queue_size=1)
+            for name in all_dog_names
+        }
+        # Scales the upper-layer acceleration correction fed to the WBC base task.
+        # The published value should be Δa = a_QP* - a_nom, not the full a_QP*.
+        self._scale = float(scale)
+
+    def publish(self, name, ax, ay):
+        msg = Vector3()
+        msg.x = float(ax) * self._scale
+        msg.y = float(ay) * self._scale
+        msg.z = 0.0
+        self._pubs[name].publish(msg)
+
+    def publish_zero(self, names):
+        zero = Vector3()
+        for name in names:
+            self._pubs[name].publish(zero)
+
+
+class CbfDebugPublisher:
+    """發布 CBF 監看量到 /cbf_debug/*（Float32），用 rqt_plot 即時看。
+    h_min_<kind>: 各類約束最小 h（實際安全距離，<0 = 撞）
+    slack_<kind>: ψ2 被違反量（含速度層 _v）
+    vcmd_<dog> / vact_<dog>: 命令 vs 實際速度大小（執行落差）
+    """
+
+    _KINDS = ("obs", "wall", "pair", "rect")
+
+    def __init__(self, dog_names):
+        self._pubs = {}
+        for k in self._KINDS:
+            self._pubs["h_" + k] = rospy.Publisher(
+                "/cbf_debug/h_min_" + k, Float32, queue_size=1)
+            self._pubs["s_" + k] = rospy.Publisher(
+                "/cbf_debug/slack_" + k, Float32, queue_size=1)
+        for name in dog_names:
+            self._pubs["vc_" + name] = rospy.Publisher(
+                "/cbf_debug/vcmd_" + name, Float32, queue_size=1)
+            self._pubs["va_" + name] = rospy.Publisher(
+                "/cbf_debug/vact_" + name, Float32, queue_size=1)
+
+    def publish(self, min_h, slack, vcmd, vact):
+        for k in self._KINDS:
+            self._pubs["h_" + k].publish(Float32(float(min_h.get(k, 9.0))))
+            # 取 base 與速度層(_v)的較大 slack
+            s = max(float(slack.get(k, 0.0)), float(slack.get(k + "_v", 0.0)))
+            self._pubs["s_" + k].publish(Float32(s))
+        for name, v in vcmd.items():
+            self._pubs["vc_" + name].publish(Float32(float(v)))
+        for name, v in vact.items():
+            self._pubs["va_" + name].publish(Float32(float(v)))
+
+
 # ═══════════════════════════════════════════════════════════════
 # 主控: FleetManagerUQP
 # ═══════════════════════════════════════════════════════════════
@@ -1866,7 +2380,7 @@ class FleetManagerUQP:
         2. LeaderNavigator → virtual center 的 u_ref (A*+PP or joystick)
         3. FormationSwitcher → 可能切換 L̂_des（自動偵測窄門）
         4. LaplacianFormation → 計算 f 和 ∂f/∂p → 轉成 g (body frame)
-        5. UnifiedQPController → 解 QP → u_safe × 3
+        5. TwoOrderCBFQPController → 解 acceleration QP → u_safe × 3
         6. Follower wz: P control 對齊 leader yaw
         7. VelocityLimiter + CmdVelPublisher → /dogN/cmd_vel
     """
@@ -1901,7 +2415,7 @@ class FleetManagerUQP:
         self.follower_names = list(rospy.get_param(
             "~follower_names", _CFG.get("follower_names", ["dog2", "dog3"])))
         self.all_dogs = [self.leader_name] + self.follower_names
-        self.rate_hz        = rospy.get_param("~rate", 20.0)
+        self.rate_hz = rospy.get_param("~rate", _CFG.get("rate", 20.0))
         self.stop_without_leader = rospy.get_param("~stop_without_leader", True)
         self.goal_topic = rospy.get_param(
             "~goal_topic", _CFG.get("goal_topic", "/formation/goal"))
@@ -2038,22 +2552,43 @@ class FleetManagerUQP:
         )
         self._door_enabled = door_enabled
 
-        # ── Module 4': UnifiedQPController ──
+        # ── Module 4': TwoOrderCBFQPController ──
         self.cbf_enabled = rospy.get_param(
             "~cbf_enabled", _CFG.get("cbf_enabled", True))
-        self.qp = UnifiedQPController(
-            gamma_robot=rospy.get_param(
-                "~cbf_gamma", _CFG.get("cbf_gamma", 1.0)),
+        cbf_gamma = rospy.get_param(
+            "~cbf_gamma", _CFG.get("cbf_gamma", 1.0))
+        cbf_gamma_obs = rospy.get_param(
+            "~cbf_gamma_obs", _CFG.get("cbf_gamma_obs", 0.5))
+        cbf_gamma_wall = rospy.get_param(
+            "~cbf_gamma_wall", _CFG.get("cbf_gamma_wall", 1.0))
+        cbf_gamma1 = rospy.get_param(
+            "~cbf_gamma1", _CFG.get("cbf_gamma1", cbf_gamma))
+        cbf_gamma2 = rospy.get_param(
+            "~cbf_gamma2", _CFG.get("cbf_gamma2", cbf_gamma))
+        cbf_gamma_obs_1 = rospy.get_param(
+            "~cbf_gamma_obs_1", _CFG.get("cbf_gamma_obs_1", cbf_gamma_obs))
+        cbf_gamma_obs_2 = rospy.get_param(
+            "~cbf_gamma_obs_2", _CFG.get("cbf_gamma_obs_2", cbf_gamma_obs))
+        cbf_gamma_wall_1 = rospy.get_param(
+            "~cbf_gamma_wall_1", _CFG.get("cbf_gamma_wall_1", cbf_gamma_wall))
+        cbf_gamma_wall_2 = rospy.get_param(
+            "~cbf_gamma_wall_2", _CFG.get("cbf_gamma_wall_2", cbf_gamma_wall))
+        self.qp = TwoOrderCBFQPController(
+            gamma_robot=cbf_gamma,
+            gamma_robot_1=rospy.get_param(
+                "~cbf_gamma_robot_1",
+                _CFG.get("cbf_gamma_robot_1", cbf_gamma1)),
+            gamma_robot_2=rospy.get_param(
+                "~cbf_gamma_robot_2",
+                _CFG.get("cbf_gamma_robot_2", cbf_gamma2)),
             d_min=rospy.get_param(
                 "~cbf_d_min", _CFG.get("cbf_d_min", 1.0)),
-            gamma_obs=rospy.get_param(
-                "~cbf_gamma_obs", _CFG.get("cbf_gamma_obs", 0.5)),
-            gamma_wall=rospy.get_param(
-                "~cbf_gamma_wall", _CFG.get("cbf_gamma_wall", 1.0)),
-            slack_lambda=rospy.get_param(
-                "~cbf_slack_lambda", _CFG.get("cbf_slack_lambda", 1e4)),
-            slack_warn_threshold=rospy.get_param(
-                "~cbf_slack_warn", _CFG.get("cbf_slack_warn", 0.05)),
+            gamma_obs=cbf_gamma_obs,
+            gamma_obs_1=cbf_gamma_obs_1,
+            gamma_obs_2=cbf_gamma_obs_2,
+            gamma_wall=cbf_gamma_wall,
+            gamma_wall_1=cbf_gamma_wall_1,
+            gamma_wall_2=cbf_gamma_wall_2,
             lookahead_tau=rospy.get_param(
                 "~cbf_lookahead_tau", _CFG.get("cbf_lookahead_tau", 0.30)),
             w_path=rospy.get_param(
@@ -2065,9 +2600,13 @@ class FleetManagerUQP:
                 "~w_formation",
                 _CFG.get("w_formation", 0.0)),
             w_reg=rospy.get_param(
-                "~w_reg", _CFG.get("w_reg", 0.1)),
+                "~w_reg", _CFG.get("w_reg", 0.0)),
+            w_accel=rospy.get_param(
+                "~w_accel", _CFG.get("w_accel", 0.5)),
             max_vx=rospy.get_param("~max_vx", _CFG.get("max_vx", 0.55)),
             max_vy=rospy.get_param("~max_vy", _CFG.get("max_vy", 0.35)),
+            max_ax=rospy.get_param("~max_ax", _CFG.get("max_ax", 1.0)),
+            max_ay=rospy.get_param("~max_ay", _CFG.get("max_ay", 1.0)),
             footprint_half_length=rospy.get_param(
                 "~robot_footprint_half_length",
                 _CFG.get("robot_footprint_half_length", 0.35)),
@@ -2091,6 +2630,24 @@ class FleetManagerUQP:
                 "~w_smooth",
                 _CFG.get("w_smooth", 0.2)),
             laplacian_ref=self.laplacian,
+            K_accel=rospy.get_param(
+                "~K_accel", _CFG.get("K_accel", 4.0)),
+            Kd_accel=rospy.get_param(
+                "~Kd_accel", _CFG.get("Kd_accel", 2.0)),
+            emergency_brake_time=rospy.get_param(
+                "~emergency_brake_time",
+                _CFG.get("emergency_brake_time", 0.20)),
+            slack_lambda=rospy.get_param(
+                "~slack_lambda", _CFG.get("slack_lambda", 1e4)),
+            slack_warn_threshold=rospy.get_param(
+                "~slack_warn_threshold",
+                _CFG.get("slack_warn_threshold", 0.05)),
+            slack_enabled=rospy.get_param(
+                "~cbf_slack_enabled", _CFG.get("cbf_slack_enabled", True)),
+            gamma_vel=rospy.get_param(
+                "~cbf_gamma_vel", _CFG.get("cbf_gamma_vel", 0.0)),
+            gamma_vel_pair=rospy.get_param(
+                "~cbf_gamma_vel_pair", _CFG.get("cbf_gamma_vel_pair", 0.0)),
         )
         if obstacles:
             self.qp.set_obstacles(obstacles)
@@ -2115,6 +2672,14 @@ class FleetManagerUQP:
 
         # ── Module 6: CmdVelPublisher ──
         self.cmd_pub = CmdVelPublisher(self.all_dogs)
+        self.accel_pub = AccelCmdPublisher(
+            self.all_dogs,
+            scale=rospy.get_param(
+                "~accel_injection_scale",
+                _CFG.get("accel_injection_scale", 1.0)),
+        )
+        # CBF 監看 topic（/cbf_debug/*，用 rqt_plot 即時看 h / slack / 速度落差）
+        self.cbf_debug_pub = CbfDebugPublisher(self.all_dogs)
 
         # ── Debug topics for RViz / external visualizers ──
         self.debug_publish_enabled = bool(rospy.get_param(
@@ -2197,6 +2762,15 @@ class FleetManagerUQP:
             "~per_dog_goal_projection_max_shift",
             _CFG.get("per_dog_goal_projection_max_shift",
                      self.astar_goal_adjust_max_dist)))
+        self.per_dog_replan_interval = float(rospy.get_param(
+            "~per_dog_replan_interval",
+            _CFG.get("per_dog_replan_interval", 1.5)))
+        self.per_dog_replan_accept_goal_shift = float(rospy.get_param(
+            "~per_dog_replan_accept_goal_shift",
+            _CFG.get("per_dog_replan_accept_goal_shift", 0.30)))
+        self.per_dog_start_adjust_max_dist = float(rospy.get_param(
+            "~per_dog_start_adjust_max_dist",
+            _CFG.get("per_dog_start_adjust_max_dist", 0.45)))
         self.kp_formation_soft = float(rospy.get_param(
             "~kp_formation_soft", _CFG.get("kp_formation_soft", 0.20)))
         self.formation_soft_max_speed = float(rospy.get_param(
@@ -2207,6 +2781,12 @@ class FleetManagerUQP:
         self._dog_path_goal_key = None
         self._dog_path_assignment = None
         self._dog_path_goal_yaw = 0.0
+        self._dog_path_last_plan_time = 0.0
+        # nominal 速度時間平滑 (EMA) 的上一輪值與係數
+        self._last_u_nominal = None
+        self.nominal_smooth_alpha = float(rospy.get_param(
+            "~nominal_smooth_alpha",
+            _CFG.get("nominal_smooth_alpha", 0.4)))
 
         # ── Formation-aware A* planning margin ──
         self.astar_formation_margin_v = float(rospy.get_param(
@@ -2237,10 +2817,11 @@ class FleetManagerUQP:
         self.cmd_vel_raw_deadband = float(rospy.get_param(
             "~cmd_vel_raw_deadband", _CFG.get("cmd_vel_raw_deadband", 1e-3)))
         self._idle_after_goal = False
+        self._cmd_vel_bootstrap_key = None
 
         rospy.sleep(1.0)
         rospy.loginfo("=" * 65)
-        rospy.loginfo("[FleetManagerUQP] READY  (Unified QP)")
+        rospy.loginfo("[FleetManagerUQP] READY  (Two-order CBF QP)")
         rospy.loginfo("  virtual_nav = formation centroid")
         rospy.loginfo("  dog order   = %s", self.all_dogs)
         rospy.loginfo("  goal_topic  = %s", self.goal_topic)
@@ -2256,13 +2837,19 @@ class FleetManagerUQP:
         rospy.loginfo("  door_switch = %s at x=%.1f (trigger=%.1fm, release=%.1fm)",
                       self._door_enabled, self.switcher.door_x,
                       self.switcher._trigger_dist, self.switcher._release_dist)
-        rospy.loginfo("  QP weights  tracking=%.1f, formation=%.2f, reg=%.2f",
-                      self.qp.w_track, self.qp.w_formation, self.qp.w_reg)
-        rospy.loginfo("  prediction  enabled=%s, horizon=%d, dt=%.3fs, smooth=%.2f",
+        rospy.loginfo(
+            "  QP weights  tracking=%.1f, formation=%.2f, accel_reg=%.2f (vel_reg removed)",
+            self.qp.w_track, self.qp.w_formation, self.qp.w_accel)
+        rospy.loginfo(
+            "  upper accel nominal PD: Kp=%.2f, Kd=%.2f",
+            self.qp.K_accel, self.qp.Kd_accel)
+        rospy.loginfo("  accel limit ax=%.2fm/s^2, ay=%.2fm/s^2",
+                      self.qp.max_ax, self.qp.max_ay)
+        rospy.loginfo("  prediction  requested=%s, active=%s, horizon=%d, dt=%.3fs",
+                      self.qp.prediction_requested,
                       self.qp.prediction_enabled,
                       self.qp.prediction_horizon,
-                      self.qp.prediction_dt,
-                      self.qp.w_smooth)
+                      self.qp.prediction_dt)
         rospy.loginfo("  tracking    kp_pos=%.2f, kp_yaw=%.2f",
                       self.kp_pos_follower, self.kp_yaw_follower)
         rospy.loginfo("  per-dog A*  = %s (goal_tol=%.2f, fail_stop=%s)",
@@ -2273,6 +2860,10 @@ class FleetManagerUQP:
                       self.per_dog_final_approach_radius,
                       self.per_dog_final_approach_kp,
                       self.per_dog_goal_unlatch_tol)
+        rospy.loginfo("    replan_interval=%.2fs, accept_goal_shift=%.2fm, start_adjust=%.2fm",
+                      self.per_dog_replan_interval,
+                      self.per_dog_replan_accept_goal_shift,
+                      self.per_dog_start_adjust_max_dist)
         rospy.loginfo("  soft_form   kp=%.2f, max_speed=%.2fm/s",
                       self.kp_formation_soft,
                       self.formation_soft_max_speed)
@@ -2307,11 +2898,17 @@ class FleetManagerUQP:
         rospy.loginfo("  idle_after_goal until new goal or raw cmd "
                       "(timeout=%.2fs, deadband=%.4f)",
                       self.cmd_vel_raw_timeout, self.cmd_vel_raw_deadband)
-        rospy.loginfo("  CBF         = %s (γ_r=%.2f, γ_obs=%.2f, γ_wall=%.2f, d_min=%.2f, λ=%.0f, τ=%.2fs)",
-                      self.cbf_enabled, self.qp.gamma_robot,
-                      self.qp.gamma_obs, self.qp.gamma_wall,
-                      self.qp.d_min, self.qp.slack_lambda,
-                      self.qp.lookahead_tau)
+        rospy.loginfo(
+            "  HOCBF       = %s (robot γ=(%.2f, %.2f), obs γ=(%.2f, %.2f), wall γ=(%.2f, %.2f))",
+            self.cbf_enabled,
+            self.qp.gamma_robot_1, self.qp.gamma_robot_2,
+            self.qp.gamma_obs_1, self.qp.gamma_obs_2,
+            self.qp.gamma_wall_1, self.qp.gamma_wall_2)
+        rospy.loginfo("    d_min=%.2f, slack=%s (λ=%.0f, warn>%.2f), τ=%.2fs",
+                      self.qp.d_min,
+                      "ON(soft)" if self.qp.slack_enabled else "OFF(HARD-verify)",
+                      self.qp.slack_lambda,
+                      self.qp.slack_warn_threshold, self.qp.lookahead_tau)
         rospy.loginfo("  obstacles   = %d,  walls = %d,  rects = %d",
                       len(self.qp.obstacles), len(self.qp.walls),
                       len(self.qp.rect_obstacles))
@@ -2599,6 +3196,7 @@ class FleetManagerUQP:
         self._dog_goal_latched = {name: False for name in self.all_dogs}
         self._dog_path_goal_key = None
         self._dog_path_assignment = None
+        self._dog_path_last_plan_time = 0.0
         if hasattr(self, "qp"):
             self.qp.reset_prediction(reason or "per-dog path reset")
         if reason:
@@ -2634,22 +3232,52 @@ class FleetManagerUQP:
         )
         paths_missing = any(not self._dog_paths.get(name)
                             for name in self.all_dogs)
-        if self._dog_path_goal_key == goal_key and not paths_missing:
+        cached_paths_valid = (
+            self._dog_path_goal_key == goal_key and not paths_missing)
+        now = rospy.get_time()
+        replan_interval = max(0.0, float(self.per_dog_replan_interval))
+        periodic_replan_due = (
+            cached_paths_valid
+            and (
+                replan_interval <= 1e-6
+                or now - self._dog_path_last_plan_time >= replan_interval
+            )
+        )
+        if cached_paths_valid and not periodic_replan_due:
             return True
+        if periodic_replan_due:
+            rospy.loginfo_throttle(
+                2.0,
+                "[PerDogA*] periodic replan after %.2fs",
+                now - self._dog_path_last_plan_time,
+            )
+
+        def keep_cached_or_fail(message, *args):
+            if periodic_replan_due:
+                self._dog_path_last_plan_time = now
+                rospy.logwarn_throttle(1.0, message + "; keeping cached path",
+                                       *args)
+                return True
+            rospy.logwarn(message, *args)
+            return False
 
         target_positions, goal_yaw = self._goal_slot_targets(goal, center_state)
         if target_positions is None:
-            rospy.logwarn_throttle(
-                1.0,
+            return keep_cached_or_fail(
                 "[PerDogA*] invalid formation offsets; cannot plan per-dog paths",
             )
-            return False
 
-        dog_positions = [states[name].pos for name in self.all_dogs]
-        assignment, _ = self._best_slot_assignment(dog_positions, target_positions)
+        if periodic_replan_due and self._dog_path_assignment is not None:
+            assignment = self._dog_path_assignment
+        else:
+            dog_positions = [states[name].pos for name in self.all_dogs]
+            assignment, _ = self._best_slot_assignment(
+                dog_positions, target_positions)
 
         new_paths = {}
         new_goals = {}
+        old_goals = dict(self._dog_path_goals)
+        old_latched = dict(self._dog_goal_latched)
         for idx, name in enumerate(self.all_dogs):
             raw_goal = target_positions[assignment[idx]]
             projected_goal, goal_shift, active = self._project_formation_target(
@@ -2660,28 +3288,64 @@ class FleetManagerUQP:
                 rospy.loginfo(
                     "[PerDogA*] %s final slot projected %.2fm (%s)",
                     name, goal_shift, ",".join(active) or "clear",
-                )
-            safe_start = self.astar.nearest_free(tuple(states[name].pos))
+            )
+            safe_start = self.astar.nearest_free(
+                tuple(states[name].pos),
+                max_dist=self.per_dog_start_adjust_max_dist,
+                label="%s start" % name,
+            )
             if safe_start is None:
-                rospy.logwarn("[PerDogA*] %s start has no nearby free cell", name)
-                return False
+                return keep_cached_or_fail(
+                    "[PerDogA*] %s start has no nearby free cell", name)
             safe_goal, path = self.astar.find_reachable_goal(
                 safe_start, tuple(projected_goal),
                 max_dist=self.astar_goal_adjust_max_dist)
             if safe_goal is None or not path:
-                rospy.logwarn(
+                return keep_cached_or_fail(
                     "[PerDogA*] %s failed path to slot%d goal=(%.2f,%.2f)",
                     name, assignment[idx], projected_goal[0], projected_goal[1])
-                return False
             new_paths[name] = path
             new_goals[name] = np.array(safe_goal, dtype=float)
 
+        if periodic_replan_due:
+            max_goal_jump = 0.0
+            for name in self.all_dogs:
+                old_goal = old_goals.get(name)
+                if old_goal is None:
+                    continue
+                max_goal_jump = max(
+                    max_goal_jump,
+                    float(np.linalg.norm(new_goals[name] - old_goal)),
+                )
+            accept_shift = max(
+                0.0, float(self.per_dog_replan_accept_goal_shift))
+            if max_goal_jump > accept_shift:
+                self._dog_path_last_plan_time = now
+                rospy.logwarn_throttle(
+                    1.0,
+                    "[PerDogA*] reject periodic replan: goal jump %.2fm > %.2fm; keeping cached path",
+                    max_goal_jump,
+                    accept_shift,
+                )
+                return True
+
         self._dog_paths = new_paths
         self._dog_path_goals = new_goals
-        self._dog_goal_latched = {name: False for name in self.all_dogs}
+        self._dog_goal_latched = {}
+        for name in self.all_dogs:
+            old_goal = old_goals.get(name)
+            keep_latched = (
+                periodic_replan_due
+                and old_latched.get(name, False)
+                and old_goal is not None
+                and float(np.linalg.norm(new_goals[name] - old_goal))
+                <= self.per_dog_goal_unlatch_tol
+            )
+            self._dog_goal_latched[name] = bool(keep_latched)
         self._dog_path_goal_key = goal_key
         self._dog_path_assignment = assignment
         self._dog_path_goal_yaw = goal_yaw
+        self._dog_path_last_plan_time = now
         rospy.loginfo(
             "[PerDogA*] planned %s | %s",
             formation_name,
@@ -2709,6 +3373,76 @@ class FleetManagerUQP:
             if float(np.linalg.norm(states[name].pos - goal)) > self.per_dog_goal_tol:
                 return False
         return True
+
+    def _obstacle_approach_scale(self, pos, vel_world):
+        """接近障礙/牆時的 nominal 減速係數 ∈ [min_scale, 1.0]。
+
+        只懲罰「朝障礙方向的前進」: 若 nominal 速度方向指向某個障礙/牆,
+        且很近, 就把速度壓低, 讓狗溫和靠近並停, 而不是全速撞上被 CBF 彈回
+        (造成前後搖晃)。側向通過 / 遠離障礙不受影響。
+
+        slow_dist: 開始減速的距離 (m); stop_dist: 壓到 min_scale 的距離。
+        距離用「沿前進方向的有號接近距離」: 障礙在正前方才減速。
+        """
+        speed = float(np.linalg.norm(vel_world))
+        if speed < 1e-6:
+            return 1.0
+        heading = vel_world / speed
+        slow_dist = float(getattr(self, "approach_slow_dist", 1.2))
+        stop_dist = float(getattr(self, "approach_stop_dist", 0.5))
+        min_scale = float(getattr(self, "approach_min_scale", 0.12))
+        scale = 1.0
+
+        def _apply(surface_dist):
+            # surface_dist: 狗中心到障礙安全邊界的距離 (已扣 radius/d_safe)
+            if surface_dist >= slow_dist:
+                return 1.0
+            if surface_dist <= stop_dist:
+                return min_scale
+            t = (surface_dist - stop_dist) / max(1e-6, slow_dist - stop_dist)
+            return min_scale + (1.0 - min_scale) * t
+
+        # 圓形障礙
+        for obs in self.qp.obstacles:
+            p_obs = np.array(obs["pos"][:2], dtype=float)
+            r = max(float(obs["radius"]),
+                    float(obs.get("physical_radius", 0.2))
+                    + self.qp._footprint_support_along(pos - p_obs, 0.0))
+            d = pos - p_obs
+            dist = float(np.linalg.norm(d))
+            if dist < 1e-6:
+                continue
+            # 只在「朝障礙前進」時減速 (heading 與 d 反向 → 朝障礙)
+            approaching = float(heading @ (d / dist)) < -0.2
+            if approaching:
+                scale = min(scale, _apply(dist - r))
+
+        # 牆
+        for wall in self.qp.walls:
+            n_w = np.array(wall["normal"][:2], dtype=float)
+            p_w = np.array(wall["point"][:2], dtype=float)
+            d_safe = max(float(wall.get("d_safe", 0.4)),
+                         self.qp._footprint_support_along(n_w, 0.0))
+            signed = float(n_w @ (pos - p_w)) - d_safe
+            # 朝牆前進 (heading 與 n_w 反向)
+            if float(heading @ n_w) < -0.2:
+                scale = min(scale, _apply(signed))
+
+        # rect (門牆)
+        for rect in self.qp.rect_obstacles:
+            center = np.array(rect["center"][:2], dtype=float)
+            size = np.array(rect["size"][:2], dtype=float)
+            d_safe = float(rect.get("d_safe", 0.35))
+            closest = closest_point_on_aabb(pos, center, size)
+            d = pos - closest
+            dist = float(np.linalg.norm(d))
+            if dist < 1e-6:
+                continue
+            approaching = float(heading @ (d / dist)) < -0.2
+            if approaching:
+                scale = min(scale, _apply(dist - d_safe))
+
+        return max(min_scale, scale)
 
     def _build_per_dog_nominal_velocity(self, states, center_state,
                                         formation_grad=None):
@@ -2789,9 +3523,25 @@ class FleetManagerUQP:
             formation_speeds.append(float(np.linalg.norm(v_form_world)))
 
             v_world = v_path_world + v_form_world
+            # 接近障礙/牆時主動減速: 避免 nominal 全速硬推向過不去的地方,
+            # 與 CBF 形成「推-擋-推-擋」的前後搖晃。讓狗溫和靠近並停穩。
+            approach_scale = self._obstacle_approach_scale(s.pos, v_world)
+            v_world = v_world * approach_scale
             v_body = rot2d(s.yaw).T @ v_world
             u_nominal[2 * idx:2 * idx + 2] = v_body
             path_speeds.append(float(np.linalg.norm(v_path_world)))
+
+        # ── nominal 速度時間平滑 (EMA 低通) ──
+        # 每 cycle 重算的 path/formation/approach 合成速度容易在方向/大小上突跳,
+        # 造成單狗搖晃、yaw 抖動、側走。用指數移動平均把相鄰 cycle 接起來:
+        #   u_smoothed = (1-a) * u_prev + a * u_new
+        # alpha 越小越平滑但越鈍; 0.3~0.5 兼顧平滑與反應。
+        smooth_alpha = float(getattr(self, "nominal_smooth_alpha", 0.4))
+        if (getattr(self, "_last_u_nominal", None) is not None
+                and len(self._last_u_nominal) == len(u_nominal)):
+            u_nominal = ((1.0 - smooth_alpha) * self._last_u_nominal
+                         + smooth_alpha * u_nominal)
+        self._last_u_nominal = u_nominal.copy()
 
         mean_path_world = np.zeros(2)
         for idx, name in enumerate(self.all_dogs):
@@ -3013,9 +3763,56 @@ class FleetManagerUQP:
         )
         self._publish_prediction_markers()
         for name in self.all_dogs:
+            accel = self.qp.last_accel_cmds.get(name, np.zeros(2))
+            self.accel_pub.publish(name, accel[0], accel[1])
             vx, vy = u_safe[name]
             vx, vy, wz = self.limiter.clamp(vx, vy, 0.0)
             self.cmd_pub.publish(name, vx, vy, wz)
+
+    def _bootstrap_is_safe_now(self, states):
+        pair_margin = 0.15
+        obstacle_margin = 0.15
+        wall_margin = 0.12
+
+        for ia in range(len(self.all_dogs)):
+            for ib in range(ia + 1, len(self.all_dogs)):
+                sa = states[self.all_dogs[ia]]
+                sb = states[self.all_dogs[ib]]
+                if not sa.received or not sb.received:
+                    return False
+                if float(np.linalg.norm(sa.pos - sb.pos)) < self.qp.d_min + pair_margin:
+                    return False
+
+        for name in self.all_dogs:
+            s = states[name]
+            if not s.received:
+                return False
+
+            for obs in self.qp.obstacles:
+                center = np.array(obs["pos"][:2], dtype=float)
+                radius = float(obs["radius"])
+                if float(np.linalg.norm(s.pos - center)) < radius + obstacle_margin:
+                    return False
+
+            for rect in self.qp.rect_obstacles:
+                center = np.array(rect["center"][:2], dtype=float)
+                size = np.array(rect["size"][:2], dtype=float)
+                d_safe = float(rect.get("d_safe", 0.35))
+                closest = closest_point_on_aabb(s.pos, center, size)
+                if float(np.linalg.norm(s.pos - closest)) < d_safe + obstacle_margin:
+                    return False
+
+            for wall in self.qp.walls:
+                normal = np.array(wall["normal"][:2], dtype=float)
+                point = np.array(wall["point"][:2], dtype=float)
+                d_safe = max(
+                    float(wall.get("d_safe", 0.4)),
+                    self.qp._footprint_support_along(normal, s.yaw),
+                )
+                if float(normal @ (s.pos - point)) < d_safe + wall_margin:
+                    return False
+
+        return True
 
     def spin(self):
         rate = rospy.Rate(self.rate_hz)
@@ -3025,6 +3822,7 @@ class FleetManagerUQP:
         while not rospy.is_shutdown():
             # ── 0. 前置檢查：等待全部 robot 狀態，避免 centroid 被未初始化座標污染 ──
             if self.stop_without_leader and not self.state_collector.all_received(self.all_dogs):
+                self.accel_pub.publish_zero(self.all_dogs)
                 self.cmd_pub.publish_zero(self.all_dogs)
                 rate.sleep()
                 continue
@@ -3037,7 +3835,8 @@ class FleetManagerUQP:
                         self.cmd_vel_raw_timeout, self.cmd_vel_raw_deadband):
                     self.navigator.clear_unreachable_hold("manual command")
                 else:
-                    self._publish_safety_hold(states)
+                    self.accel_pub.publish_zero(self.all_dogs)
+                    self.cmd_pub.publish_zero(self.all_dogs)
                     rate.sleep()
                     continue
 
@@ -3064,6 +3863,7 @@ class FleetManagerUQP:
                               self.goal_hold_seconds)
 
             if self._goal_hold_counter > 0 and not self.navigator.has_goal:
+                self.accel_pub.publish_zero(self.all_dogs)
                 self.cmd_pub.publish_zero(self.all_dogs)
                 self._goal_hold_counter -= 1
                 rate.sleep()
@@ -3073,10 +3873,12 @@ class FleetManagerUQP:
                 self._idle_after_goal = False
             elif self._dog_path_goal_key is not None:
                 self._reset_per_dog_paths("no active AUTO goal")
+                self._cmd_vel_bootstrap_key = None
             if (self._idle_after_goal
                     and not self.navigator.has_goal
                     and not self.navigator.manual_command_active(
                         self.cmd_vel_raw_timeout, self.cmd_vel_raw_deadband)):
+                self.accel_pub.publish_zero(self.all_dogs)
                 self.cmd_pub.publish_zero(self.all_dogs)
                 rate.sleep()
                 continue
@@ -3085,6 +3887,7 @@ class FleetManagerUQP:
             if (mode_after == LeaderNavigator.MODE_KEYBOARD
                     and not self.navigator.has_goal
                     and not manual_command_active):
+                self.accel_pub.publish_zero(self.all_dogs)
                 self.cmd_pub.publish_zero(self.all_dogs)
                 rate.sleep()
                 continue
@@ -3127,42 +3930,130 @@ class FleetManagerUQP:
                 self.navigator.hold_unreachable_goal(
                     reason or "per-dog A* failed")
                 self._reset_per_dog_paths(reason or "per-dog A* failed")
-                self._publish_safety_hold(states)
+                self.accel_pub.publish_zero(self.all_dogs)
+                self.cmd_pub.publish_zero(self.all_dogs)
                 rate.sleep()
                 continue
 
-            # ── 4. 解 Unified QP ──
-            # cbf_enabled 只控制安全 constraints；formation/path objective 仍會保留。
-            u_safe = self.qp.solve(
-                self.all_dogs, states, u_nominal,
-                formation_grad=formation_grad,
-                cbf_enabled=self.cbf_enabled,
-                dt=1.0 / max(1e-3, float(self.rate_hz)),
-            )
-            self._publish_prediction_markers()
-
-            # ── 5. yaw tracking: 對齊平滑的 formation heading，不追 Pure Pursuit 瞬時 wz ──
+            # ── 4. yaw tracking：統一朝編隊前進方向 ──
+            # (先前試過各自朝移動方向, 但三隻狗朝向各異看起來凌亂; 改回統一,
+            #  三隻狗朝同一方向比較像一個整體編隊。)
             wz_all = {}
             for name in self.all_dogs:
                 s = states[name]
                 e_yaw = wrap_to_pi(self._last_formation_yaw - s.yaw)
                 wz_all[name] = self.kp_yaw_follower * e_yaw
 
-            # ── 6. Velocity limiter + publish ──
+            # ── 5. 算 a_nom：上層二階 PD nominal acceleration，先 world 再轉 body ──
+            # a_nom^W = K_accel (p_d - p) + Kd_accel (v_d - v)
+            # a_nom^B = R(psi)^T a_nom^W
+            #
+            # 設計（與 _build_per_dog_nominal_velocity / u_nominal 完全一致）：
+            #   v_d  ← 直接複用 u_nominal 的成品（已含 final-approach 切換、
+            #          speed_scale 衰減、obstacle approach 減速、EMA 平滑），
+            #          不在此重算，確保 a_nom 的期望速度與 u_nom 永遠同步。
+            #   p_d  ← 兩段式（與 u_nom 同樣的 final_approach_radius 切換條件）：
+            #            靠近 goal → p_d = 固定 slot goal（真正的平衡點，會歸零）
+            #            趕路       → p_d = lookahead（沿 A* 路徑，給前進方向）
+            #   latched → 純阻尼 a_nom = -Kd_accel·v（吃掉到點殘速 + trot 噪聲，
+            #             乾淨停住；不再用 lookahead 持續往前推 → 根除拉扯）。
+            #   latch 狀態只讀不重算（步驟 3 的 u_nom 已更新好，避免雙重判定）。
+            #
+            # 守衛：latched 是 per-dog AUTO 專屬狀態，只在 per-dog AUTO 模式才
+            #       信任它。非 per-dog（keyboard/centroid）模式即使殘留舊 latch
+            #       也不走純阻尼分支，避免與手動/centroid 速度指令打架。
+            per_dog_active = self._per_dog_auto_active()
+            a_desired = np.zeros(2 * len(self.all_dogs))
+            for idx, name in enumerate(self.all_dogs):
+                s = states[name]
+                if not s.received:
+                    continue
+
+                # latched：純阻尼煞停（乙案），不施加前進期望
+                if per_dog_active and self._dog_goal_latched.get(name, False):
+                    a_d_world = -self.qp.Kd_accel * s.vel_world
+                    a_d_body = rot2d(s.yaw).T @ a_d_world
+                    a_desired[2 * idx:2 * idx + 2] = a_d_body
+                    continue
+
+                # v_d：直接取 u_nominal 成品（body frame）→ 轉 world
+                v_d_body = u_nominal[2 * idx:2 * idx + 2]
+                v_d_world = rot2d(s.yaw) @ np.array(v_d_body, dtype=float)
+
+                # p_d：與 u_nom 相同的兩段式切換
+                path = self._dog_paths.get(name, [])
+                goal = self._dog_path_goals.get(name)
+                goal_error = (float(np.linalg.norm(s.pos - goal))
+                              if goal is not None else None)
+                if (goal is not None
+                        and goal_error is not None
+                        and goal_error <= self.per_dog_final_approach_radius):
+                    p_d = np.array(goal, dtype=float)          # 靠近：固定 goal
+                elif path:
+                    p_d = np.array(
+                        self.dog_pursuers[name]._find_lookahead(s.pos, path),
+                        dtype=float)                            # 趕路：lookahead
+                else:
+                    p_d = s.pos.copy()
+
+                a_d_world = (
+                    self.qp.K_accel * (p_d - s.pos)
+                    + self.qp.Kd_accel * (v_d_world - s.vel_world))
+                a_d_body = rot2d(s.yaw).T @ a_d_world
+                a_desired[2 * idx:2 * idx + 2] = a_d_body
+
+            # ── 6. 解 pure second-order HOCBF acceleration QP ──
+            # cbf_enabled 只控制安全 constraints；formation/path objective 仍會保留。
+            control_dt = 1.0 / max(1e-3, float(self.rate_hz))
+            u_safe = self.qp.solve(
+                self.all_dogs, states, u_nominal,
+                a_desired=a_desired,
+                formation_grad=formation_grad,
+                cbf_enabled=self.cbf_enabled,
+                dt=control_dt,
+                yaw_rates=wz_all,
+            )
+            self._publish_prediction_markers()
+
+            # ── CBF 監看：發布 /cbf_debug/*（rqt_plot 即時看 h / slack / 速度落差）──
+            vcmd = {n: float(np.hypot(*u_safe[n])) for n in self.all_dogs}
+            vact = {n: float(np.linalg.norm(states[n].vel_world))
+                    for n in self.all_dogs}
+            self.cbf_debug_pub.publish(
+                self.qp.last_min_h_by_kind, self.qp.last_slack_by_kind,
+                vcmd, vact)
+
+            # ── 7. Velocity limiter + publish ──
+            bootstrap_key = (
+                self._dog_path_goal_key if self._per_dog_auto_active()
+                else None)
+            bootstrap_cmd_vel = (
+                bootstrap_key is not None
+                and self._cmd_vel_bootstrap_key != bootstrap_key
+                and self._bootstrap_is_safe_now(states))
             for name in self.all_dogs:
-                vx, vy = u_safe[name]
+                idx = self.all_dogs.index(name)
+                safe_accel = self.qp.last_accel_cmds.get(name, np.zeros(2))
+                self.accel_pub.publish(name, safe_accel[0], safe_accel[1])
+                if bootstrap_cmd_vel:
+                    vx = float(u_nominal[2 * idx] + control_dt * safe_accel[0])
+                    vy = float(u_nominal[2 * idx + 1] + control_dt * safe_accel[1])
+                else:
+                    vx, vy = u_safe[name]
                 wz = wz_all[name]
                 vx, vy, wz = self.limiter.clamp(vx, vy, wz)
                 self.cmd_pub.publish(name, vx, vy, wz)
+            if bootstrap_cmd_vel:
+                self._cmd_vel_bootstrap_key = bootstrap_key
 
-            # ── 7. Stuck detection（保留）──
+            # ── 8. Stuck detection（保留）──
             center_u_safe = np.mean(
                 np.array([u_safe[name] for name in self.all_dogs], dtype=float),
                 axis=0,
             )
             self._update_stuck_state(center_u_safe, states, center_state)
 
-            # ── 8. 診斷 log（每 2 秒一次）──
+            # ── 9. 診斷 log（每 2 秒一次）──
             if hasattr(self, '_log_counter'):
                 self._log_counter += 1
             else:
@@ -3170,10 +4061,10 @@ class FleetManagerUQP:
             if self._log_counter % (int(self.rate_hz) * 2) == 0:
                 rospy.loginfo_throttle(
                     2.0,
-                    "[UQP] f=%.4f | form='%s' | slack=%.3f | center=(%.2f,%.2f)",
+                    "[UQP] f=%.4f | form='%s' | hocbf=%s | center=(%.2f,%.2f)",
                     f_cost,
                     self.laplacian.current_formation,
-                    self.qp.last_max_slack,
+                    self.qp.last_cbf_status,
                     center_state.x, center_state.y,
                 )
                 if target_diag.get("path_mode", False):
@@ -3226,9 +4117,8 @@ class FleetManagerUQP:
             self._stuck_counter = 0
             self._cooldown_counter = 0
             return
-        slack = self.qp.last_max_slack
-        reason = "formation center speed≈0 for %.2fs (max slack ε=%.3f)" % (
-            self._stuck_counter / self.rate_hz, slack)
+        reason = "formation center speed≈0 for %.2fs (hard HOCBF status=%s)" % (
+            self._stuck_counter / self.rate_hz, self.qp.last_cbf_status)
         if self.per_dog_astar_enabled:
             self._reset_per_dog_paths(reason)
             self._consec_replans += 1

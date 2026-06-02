@@ -7,6 +7,7 @@ Inputs:
   /formation/projected_goals       geometry_msgs/PoseArray
   /formation/current_formation     std_msgs/String
   /formation/dogN_astar_path       nav_msgs/Path
+  /formation/prediction_markers    visualization_msgs/MarkerArray
 
 Outputs:
   /formation/debug_markers         visualization_msgs/MarkerArray
@@ -52,17 +53,22 @@ def quaternion_to_yaw(q):
 class FormationDebugVisualizer:
     def __init__(self):
         rospy.init_node("formation_debug_visualizer")
-        self.cfg = load_config(CONFIG_PATH)
+        self.config_path = rospy.get_param("~config_path", CONFIG_PATH)
+        self.cfg = load_config(self.config_path)
         self.frame_id = rospy.get_param(
             "~debug_frame_id", self.cfg.get("debug_frame_id", "map"))
         self.rate_hz = float(rospy.get_param("~rate", 5.0))
         self.world_path = rospy.get_param(
             "~gazebo_world_path",
             self.cfg.get("debug_gazebo_world_path", DEFAULT_WORLD_PATH))
+        self.draw_goal_formation_edges = bool(rospy.get_param(
+            "~debug_draw_goal_formation_edges",
+            self.cfg.get("debug_draw_goal_formation_edges", False)))
         self._world_geometry = self._load_world_geometry(self.world_path)
-        self.leader_name = rospy.get_param("~leader_name", "dog1")
-        self.follower_names = rospy.get_param(
-            "~follower_names", ["dog2", "dog3"])
+        self.leader_name = rospy.get_param(
+            "~leader_name", self.cfg.get("leader_name", "dog1"))
+        self.follower_names = list(rospy.get_param(
+            "~follower_names", self.cfg.get("follower_names", ["dog2", "dog3"])))
         self.all_dogs = [self.leader_name] + list(self.follower_names)
 
         self._lock = threading.Lock()
@@ -70,6 +76,7 @@ class FormationDebugVisualizer:
         self._current_formation = ""
         self._dog_positions = {}
         self._dog_paths = {name: Path() for name in self.all_dogs}
+        self._prediction_markers = []
 
         rospy.Subscriber(
             "/formation/projected_goals",
@@ -98,10 +105,17 @@ class FormationDebugVisualizer:
                 callback_args=name,
                 queue_size=1,
             )
+        rospy.Subscriber(
+            "/formation/prediction_markers",
+            MarkerArray,
+            self._prediction_cb,
+            queue_size=1,
+        )
         self._pub = rospy.Publisher(
             "/formation/debug_markers", MarkerArray, queue_size=1, latch=True)
         rospy.loginfo(
-            "[FormationDebugVisualizer] ready, gazebo_world=%s, geometry=%d",
+            "[FormationDebugVisualizer] ready, config=%s, gazebo_world=%s, geometry=%d",
+            self.config_path,
             self.world_path,
             len(self._world_geometry),
         )
@@ -123,6 +137,13 @@ class FormationDebugVisualizer:
     def _path_cb(self, msg, name):
         with self._lock:
             self._dog_paths[name] = msg
+
+    def _prediction_cb(self, msg):
+        with self._lock:
+            self._prediction_markers = [
+                marker for marker in msg.markers
+                if marker.action != Marker.DELETEALL
+            ]
 
     def _base_marker(self, ns, marker_id, marker_type):
         marker = Marker()
@@ -716,6 +737,8 @@ class FormationDebugVisualizer:
 
     def _goal_formation_edge_markers(self, goals):
         markers = []
+        if not self.draw_goal_formation_edges:
+            return markers
         if len(goals.poses) < 2:
             return markers
 
@@ -822,6 +845,7 @@ class FormationDebugVisualizer:
                 formation = self._current_formation
                 dog_positions = dict(self._dog_positions)
                 dog_paths = dict(self._dog_paths)
+                prediction_markers = list(self._prediction_markers)
 
             msg = MarkerArray()
             msg.markers.append(self._delete_all_marker())
@@ -834,6 +858,7 @@ class FormationDebugVisualizer:
             msg.markers.extend(self._current_formation_markers(dog_positions))
             msg.markers.extend(self._projected_goal_markers(goals))
             msg.markers.extend(self._goal_formation_edge_markers(goals))
+            msg.markers.extend(prediction_markers)
             msg.markers.append(self._formation_marker(formation))
             msg.markers.append(self._safety_legend_marker())
             self._pub.publish(msg)

@@ -14,6 +14,7 @@ find_package(catkin REQUIRED
         controller_interface
         ocs2_legged_robot_ros
         ocs2_self_collision_visualization
+        geometry_msgs
         angles
         )
 
@@ -34,6 +35,7 @@ catkin_package(
         controller_interface
         ocs2_legged_robot_ros
         ocs2_self_collision_visualization
+        geometry_msgs
         angles
 )
 

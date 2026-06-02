@@ -18,6 +18,7 @@
 #include <ocs2_sqp/SqpMpc.h>
 
 #include <angles/angles.h>
+#include <cmath>
 #include <legged_estimation/FromTopiceEstimate.h>
 #include <legged_estimation/LinearKalmanFilter.h>
 #include <legged_wbc/HierarchicalWbc.h>
@@ -72,6 +73,13 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw,
   ros::NodeHandle nh(ros::names::parentNamespace(
                      ros::names::parentNamespace(
                      controller_nh.getNamespace())));
+  accelCmd_.x = 0.0;
+  accelCmd_.y = 0.0;
+  accelCmd_.z = 0.0;
+  accelCmdStamp_ = ros::Time(0);
+  controller_nh.param("accelCmdTimeout", accelCmdTimeout_, accelCmdTimeout_);
+  accelCmdSubscriber_ = nh.subscribe<geometry_msgs::Vector3>(
+      "accel_cmd", 1, &LeggedController::accelCmdCallback, this);
 
   CentroidalModelPinocchioMapping pinocchioMapping(leggedInterface_->getCentroidalModelInfo());
   eeKinematicsPtr_ = std::make_shared<PinocchioEndEffectorKinematics>(
@@ -155,6 +163,16 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   currentObservation_.input = optimizedInput;
 
   wbcTimer_.startTimer();
+  const bool accelCmdFresh =
+      !accelCmdStamp_.isZero() && (time - accelCmdStamp_).toSec() <= accelCmdTimeout_;
+  const scalar_t accelCmdX = accelCmdFresh ? accelCmd_.x : 0.0;
+  const scalar_t accelCmdY = accelCmdFresh ? accelCmd_.y : 0.0;
+  const scalar_t yaw = measuredRbdState_(0);
+  const scalar_t cosYaw = std::cos(yaw);
+  const scalar_t sinYaw = std::sin(yaw);
+  const scalar_t accelXWorld = cosYaw * accelCmdX - sinYaw * accelCmdY;
+  const scalar_t accelYWorld = sinYaw * accelCmdX + cosYaw * accelCmdY;
+  wbc_->setUpperLayerAccel(accelXWorld, accelYWorld);
   vector_t x = wbc_->update(optimizedState, optimizedInput, measuredRbdState_,
                              plannedMode, period.toSec());
   wbcTimer_.endTimer();
@@ -180,6 +198,11 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   selfCollisionVisualization_->update(currentObservation_);
 
   observationPublisher_.publish(ros_msg_conversions::createObservationMsg(currentObservation_));
+}
+
+void LeggedController::accelCmdCallback(const geometry_msgs::Vector3ConstPtr& msg) {
+  accelCmd_ = *msg;
+  accelCmdStamp_ = ros::Time::now();
 }
 
 void LeggedController::updateStateEstimation(const ros::Time& time, const ros::Duration& period) {

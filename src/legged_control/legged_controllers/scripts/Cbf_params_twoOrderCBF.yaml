@@ -1,46 +1,95 @@
 # ═══════════════════════════════════════════════════════════════
-# Cbf_params_uqp.yaml — Unified QP 版本參數
-# 對應 formation_manager_unified_qp.py
+# Cbf_params_twoOrderCBF.yaml — Two-order CBF QP 版本參數
+# 對應 Formation_manager_unified_twoOrderCBF.py
 # ═══════════════════════════════════════════════════════════════
 
 # ── CBF 參數（從舊版完整保留）──
 cbf_enabled: true
-cbf_d_min: 1.0
-cbf_gamma: 1.0
-cbf_gamma_obs: 0.5
-cbf_gamma_wall: 1.0
-cbf_slack_lambda: 10000.0
-cbf_slack_warn: 0.05
-cbf_lookahead_tau: 0.30
+# dog-dog 最小間距。注意 V_narrow 最近一對 slot 只 1.03m，
+# d_min 不能逼近它否則窄門會 CBF↔formation 互打。0.85 留 ~0.18m 餘量。
+cbf_d_min: 0.85
+cbf_gamma: 0.6
+cbf_gamma_obs: 0.35
+cbf_gamma_wall: 0.55
+cbf_gamma1: 1.5
+cbf_gamma2: 1.5
+# 可個別覆蓋；未設定時程式會沿用上面的 gamma 或舊版 gamma。
+# cbf_gamma_robot_1: 1.0
+# cbf_gamma_robot_2: 1.0
+cbf_gamma_obs_1: 3.0
+cbf_gamma_obs_2: 3.0
+cbf_gamma_wall_1: 1.2
+cbf_gamma_wall_2: 1.2
+# ── HOCBF soft constraint (slack) ──
+# 軟約束 A·a >= b - ε，重罰 λ‖ε‖²。可行時 ε=0（等同硬 CBF，嚴格保證）；
+# 窄處原本 infeasible 時取「最小違反」繼續動，而不是 emergency brake 卡死。
+# 一階版就是靠這個擠過窄縫；λ 越大越接近硬 CBF。
+# 監看 log "[TwoOrderCBF] slack active ... by kind=" 看是哪類(pair/obs/rect/wall)在頂。
+slack_lambda: 10000.0
+slack_warn_threshold: 0.05
+# true  = 運行模式(軟約束,擠得過窄處,但數學上准許微小違反)
+# false = 驗證模式(純硬 CBF,無 slack):此時 h≥0 才是真正保證。
+#         配 /cbf_debug/h_min_* 看 h 有沒有破 0:沒破=CBF對(撞就是模型/執行落差);
+#         破了=執行/離散落差;頻繁 emergency brake=約束過緊。驗證完記得改回 true。
+cbf_slack_enabled: true
+# ── 一階(速度層)CBF 安全層（已關閉）──
+# 目前採「純二階 HOCBF」：不再額外加入 dot(h)_next + gamma_v h >= 0。
+# 這兩個參數保留只為相容舊版 launch/config；程式端已移除速度層 CBF row。
+cbf_gamma_vel: 0.0
+cbf_gamma_vel_pair: 0.0
+# 二階 CBF 不用 lookahead：hddot 已含加速度趨勢，h/hdot/hddot 必須用同一基點 s.pos。
+cbf_lookahead_tau: 0.0
+w_pred: 20.0    # 遠期軟 cost 權重,先用預設
+# ── 上層 QP 加速度注入 WBC base-accel 的縮放係數 ──
+# WBC 已用質心前饋追 cmd_vel(=安全速度)；這個注入是額外的 x,y 加速度補償。
+# 注入 + MPC 前饋會在 x,y 暫態疊加(約 2x)，遠離障礙追目標時可能讓狗加速過頭、
+# 跑贏 CBF 的點模型而撞上。
+#   0.0 = 關閉注入(只靠 cmd_vel→MPC，等同 demo 安全 baseline)
+#   1.0 = 完整注入修正量 Δa = a_QP* - a_nom
+#   0.3~0.5 = 折衷：補一點加速度保真度但不過衝
+accel_injection_scale: 0
 
 # ── Robot set（三隻狗）──
 leader_name: "dog1"
 follower_names: ["dog2", "dog3"]
+rate: 50.0
+approach_slow_dist: 1.2
+approach_stop_dist: 0.5
+approach_min_scale: 0.12
 
 # ── Unified QP cost 權重（新增）──
 # w_path:      保留舊參數相容性；目前 tracking 由 w_track 控制
 # w_track:     nominal/path tracking 權重。越大 → 越追 u_nominal
 # w_formation: Laplacian formation cost rate 權重，直接進 QP objective
-# w_reg:       正則項權重。防止速度過度激進
+# w_reg:       已移除/設 0。速度上限由 |u_next| <= u_max 的 hard bound 保護
+# w_accel:     二階版 acceleration 正則項。越大 → 加速度越平滑，但避障反應較慢
 #
 # 調參原則:
-#   w_track 越大越貼近 path/slot nominal，但遇到牆/障礙時 slack 可能變大
+#   w_track 越大越貼近 path/slot nominal，但越可能和 hard CBF 衝突
 #   w_formation 越大越直接壓低 Laplacian formation cost，但太大會和 path/CBF 搶控制權
 #   kp_pos_follower 越大越快收斂隊形，但也越容易在窄門附近推太急
 #   w_reg 通常 0.05~0.2，太大會讓所有狗動作變慢
 w_path: 1.0
-w_track: 6.0
-w_formation: 1.0
-w_reg: 0.1
+w_track: 4.0
+w_formation: 1
+nominal_smooth_alpha: 1
+w_reg: 0.0
+w_accel: 0.15
+# position error → acceleration reference 增益 (1/s²)
+K_accel: 4.0
+# velocity error → acceleration reference gain (1/s)
+Kd_accel: 4.0
+emergency_brake_time: 0.20
 
-# ── Multi-step receding horizon（preview QP，預設關閉）──
-# prediction_enabled: false 時維持原本 single-step QP code path。
-# prediction_horizon: 3~10 可用來啟用多步速度序列；1 等價 single-step。
+# ── Multi-step receding horizon（目前二階版先關閉）──
+# 二階版目前採 single-step acceleration HOCBF；prediction 之後另接。
+# prediction_enabled: true 時程式只會記錄 requested，實際仍跑 single-step。
+# prediction_horizon: 保留給未來 multi-step acceleration HOCBF。
 # prediction_dt: 0.0 表示沿用 control loop dt。
-# w_smooth: 相鄰 horizon velocity 平滑項，讓 future CBF 趨勢回傳到第一步。
+# w_smooth: 保留給未來 horizon acceleration/velocity 平滑項。
 prediction_enabled: true
 prediction_horizon: 10
-prediction_dt: 0.20
+prediction_dt: 0.2
 w_smooth: 1.0
 
 # ── 編隊 offset 定義（新增）──
@@ -62,7 +111,7 @@ kp_yaw: 0.6
 # 每隻狗的 vx/vy nominal velocity:
 #   v_i = v_center + kp_pos_follower * (target_offset_position_i - position_i)
 # 越大 → robot 越積極追到 centroid 周圍的指定 offset
-kp_pos_follower: 0.8
+kp_pos_follower: 0.6
 
 # ── Formation target safety projection（新增）──
 # target_pos 太靠近 obstacle / rect / wall 時，先把當下 slot target 往安全側推回來。
@@ -73,8 +122,13 @@ target_projection_max_shift: 0.45
 # ── Robot footprint / drift model（新增）──
 # CBF/A* 的點模型只代表 base center；Gazebo 碰撞會用 body/legs。
 # 這裡用外接矩形估計 body + leg swing，讓「中心點安全線」對應到實際外輪廓。
-robot_footprint_half_length: 0.35
-robot_footprint_half_width: 0.20
+# 用在三處 CBF：圓形障礙、門牆(rect)、dog-dog(方向感知)。
+# half_width 從 0.20 調大到 0.28：原值低估了 trot 時腿往側向擺動的範圍，
+#   導致狗「貼著障礙側面過」時鼻/腿啃到(中心 clearance 0.30 < 真實 ~0.35)。
+# half_length 0.35→0.40：面對障礙/別隻狗時的縱向真實外輪廓。
+# 若你知道 A1 實際碰撞外框，直接照實量值改這兩個數。
+robot_footprint_half_length: 0.40
+robot_footprint_half_width: 0.28
 robot_footprint_drift_margin: 0.08
 
 # ── Formation error guard（新增）──
@@ -94,8 +148,20 @@ per_dog_goal_tol: 0.22
 per_dog_goal_unlatch_tol: 0.35
 per_dog_goal_slow_radius: 0.80
 per_dog_final_approach_radius: 0.55
-per_dog_final_approach_kp: 0.90
+per_dog_final_approach_kp: 0.70
 per_dog_goal_projection_max_shift: 0.75
+# 二階 HOCBF 沒有 slack，讓 A* reference 更新，避免 nominal path
+# 長時間把狗推向已經被 CBF 擋住的位置。0.0 表示每個 control cycle 都 replan。
+per_dog_replan_interval: 3.0
+
+# Replan 只在新 final goal 和舊 final goal 足夠接近時才替換，避免 reference
+# 每次 nearest-free / target projection 都跳到障礙物另一側。
+# 放寬:slot 落在不可達死角時,容許重導到較遠的可達點(隊形容許變形、貼近目標,
+# 不要卡在舊 cached path)。dynamic_slot 已關,抖動風險低。
+per_dog_replan_accept_goal_shift: 1.0
+# Per-dog A* 的 start 只能小範圍修到鄰近 free cell；超過代表目前狗的位置
+# 已經和 planning map inflation 衝突，沿用舊 path/停住比從假 start 規劃穩。
+per_dog_start_adjust_max_dist: 0.45
 kp_formation_soft: 0.35
 formation_soft_max_speed: 0.18
 
@@ -134,9 +200,11 @@ astar_forbidden_zones:
 
 # Goal 若落在 occupied/forbidden 區，nearest_free 修正超過此距離就拒絕，
 # 避免 goal 被偷偷改到很遠的位置。
-astar_goal_adjust_max_dist: 0.75
+# 放寬:per-dog slot 落在死角(障礙↔牆窄縫)時,允許往外找更遠的可達點(≤1.2m),
+# 讓那隻狗導到貼近、可達的位置而非規劃失敗卡住。(中心 goal 通常本就可達,不受影響)
+astar_goal_adjust_max_dist: 1.2
 astar_goal_min_obstacle_clearance: 0.10
-astar_goal_min_wall_clearance: 0.50
+astar_goal_min_wall_clearance: 0.90
 
 # ── Formation-level command topics（新增）──
 goal_topic: "/formation/goal"
@@ -149,12 +217,12 @@ debug_frame_id: "map"
 debug_obstacle_physical_radius: 0.20
 
 # ── 自動隊形切換（取代 DoorPassageManager）──
-door_mode_enabled: true
+door_mode_enabled: false
 door_x: 6.0
-door_passage_formation: "V_narrow"
-door_line_formation: "V_narrow"  # 舊參數名相容；門口改用窄三角形，不切單列。
+door_passage_formation: "line"   # 過門切「單列」：硬 CBF 驗證證明 V_narrow 過門無解(infeasible)。
+door_line_formation: "line"      # 舊參數名相容,一起設 line。
 door_trigger_dist: 2.0    # 任一狗/centroid 距門 < 此值且需穿門 → 切窄三角形
-door_release_dist: 1.8    # 全隊離門 > 此值 → 切回 V
+door_release_dist: 1.2   # 全隊離門 > 此值 → 切回 V
 
 # ── Stuck detection（從舊版保留）──
 stuck_speed_threshold: 0.05
@@ -163,9 +231,11 @@ stuck_replan_cooldown: 30
 stuck_max_replans: 3
 
 # ── Velocity limits（從舊版保留）──
-max_vx: 0.75
-max_vy: 0.55
+max_vx: 0.55
+max_vy: 0.40
 max_wz: 0.8
+max_ax: 2.5
+max_ay: 2.0
 
 # ── A* 路徑規劃參數（從舊版保留）──
 astar_resolution: 0.1
@@ -178,7 +248,7 @@ map_y_max: 5.0
 
 # ── Pure Pursuit 參數（從舊版保留）──
 pp_look_ahead: 0.8
-pp_v_cruise: 0.75
+pp_v_cruise: 0.55
 pp_kp_yaw: 0.6
 pp_goal_tol: 0.3
 
@@ -187,6 +257,9 @@ pp_goal_tol: 0.3
 goal_hold_seconds: 2.0
 cmd_vel_raw_timeout: 0.4
 cmd_vel_raw_deadband: 0.001
+# goal_yaw 凍結 + 平滑(治接近目標時 slot 朝向被重心噪聲放大的飄)
+goal_yaw_freeze_dist: 1.0   # 重心離目標 <此值(m) → 朝向鎖定,不再用 atan2 算
+goal_yaw_ema_alpha: 0.3     # 遠離目標時朝向的角度 EMA 係數(越小越平滑越鈍)
 
 # ── 場地障礙物（從舊版保留）──
 rect_obstacles:
@@ -195,11 +268,11 @@ rect_obstacles:
   - {center: [6.0, -3.125], size: [0.15, 3.75], d_safe: 0.35, astar_margin: 0.40}
 
 obstacles:
-  - {pos: [7.5, 2.5],   physical_radius: 0.20, radius: 0.50, astar_radius: 0.50}
-  - {pos: [8.5, -1.5],  physical_radius: 0.20, radius: 0.50, astar_radius: 0.50}
-  - {pos: [9.0, 3.5],   physical_radius: 0.20, radius: 0.50, astar_radius: 0.50}
-  - {pos: [7.0, -3.0],  physical_radius: 0.20, radius: 0.50, astar_radius: 0.50}
-  - {pos: [8.0, 0.5],   physical_radius: 0.20, radius: 0.50, astar_radius: 0.50}
+  - {pos: [7.5, 2.5],   physical_radius: 0.28, radius: 0.50, astar_radius: 0.50}
+  - {pos: [8.5, -1.5],  physical_radius: 0.28, radius: 0.50, astar_radius: 0.50}
+  - {pos: [9.0, 3.5],   physical_radius: 0.28, radius: 0.50, astar_radius: 0.50}
+  - {pos: [7.0, -3.0],  physical_radius: 0.28, radius: 0.50, astar_radius: 0.50}
+  - {pos: [8.0, 0.5],   physical_radius: 0.28, radius: 0.50, astar_radius: 0.50}
 
 walls:
   - {normal: [-1, 0], point: [10.0, 0],  d_safe: 0.45}

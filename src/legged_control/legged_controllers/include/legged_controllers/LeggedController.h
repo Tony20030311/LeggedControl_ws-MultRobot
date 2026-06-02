@@ -5,6 +5,7 @@
 #pragma once
 
 #include <controller_interface/multi_interface_controller.h>
+#include <geometry_msgs/Vector3.h>
 #include <hardware_interface/imu_sensor_interface.h>
 #include <legged_common/hardware_interface/ContactSensorInterface.h>
 
@@ -42,6 +43,7 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   virtual void setupMpc();
   virtual void setupMrt();
   virtual void setupStateEstimate(const std::string& taskFile, bool verbose);
+  void accelCmdCallback(const geometry_msgs::Vector3ConstPtr& msg);
 
   // Interface
   std::shared_ptr<LeggedInterface> leggedInterface_;
@@ -68,6 +70,10 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   std::shared_ptr<LeggedRobotVisualizer> robotVisualizer_;
   std::shared_ptr<LeggedSelfCollisionVisualization> selfCollisionVisualization_;
   ros::Publisher observationPublisher_;
+  ros::Subscriber accelCmdSubscriber_;
+  geometry_msgs::Vector3 accelCmd_;
+  ros::Time accelCmdStamp_;
+  scalar_t accelCmdTimeout_{0.15};
 
  private:
   std::thread mpcThread_;

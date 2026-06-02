@@ -11,6 +11,7 @@
 #include <pinocchio/algorithm/crba.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
+#include <cmath>
 #include <utility>
 
 namespace legged {
@@ -24,6 +25,9 @@ WbcBase::WbcBase(const PinocchioInterface& pinocchioInterface, CentroidalModelIn
   numDecisionVars_ = info_.generalizedCoordinatesNum + 3 * info_.numThreeDofContacts + info_.actuatedDofNum;
   qMeasured_ = vector_t(info_.generalizedCoordinatesNum);
   vMeasured_ = vector_t(info_.generalizedCoordinatesNum);
+  qDesired_ = vector_t(info_.generalizedCoordinatesNum);
+  vDesired_ = vector_t(info_.generalizedCoordinatesNum);
+  upperLayerAccel_.setZero();
 }
 
 vector_t WbcBase::update(const vector_t& stateDesired, const vector_t& inputDesired, const vector_t& rbdStateMeasured, size_t mode,
@@ -86,11 +90,13 @@ void WbcBase::updateDesired(const vector_t& stateDesired, const vector_t& inputD
 
   mapping_.setPinocchioInterface(pinocchioInterfaceDesired_);
   const auto qDesired = mapping_.getPinocchioJointPosition(stateDesired);
+  const vector_t vDesired = mapping_.getPinocchioJointVelocity(stateDesired, inputDesired);
+  qDesired_ = qDesired;
+  vDesired_ = vDesired;
   pinocchio::forwardKinematics(model, data, qDesired);
   pinocchio::computeJointJacobians(model, data, qDesired);
   pinocchio::updateFramePlacements(model, data);
   updateCentroidalDynamics(pinocchioInterfaceDesired_, info_, qDesired);
-  const vector_t vDesired = mapping_.getPinocchioJointVelocity(stateDesired, inputDesired);
   pinocchio::forwardKinematics(model, data, qDesired, vDesired);
 }
 
@@ -171,30 +177,54 @@ Task WbcBase::formulateFrictionConeTask() {
   return {a, b, d, f};
 }
 
-Task WbcBase::formulateBaseAccelTask(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
+Task WbcBase::formulateBaseMotionTrackingTask(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
   matrix_t a(6, numDecisionVars_);
   a.setZero();
   a.block(0, 0, 6, 6) = matrix_t::Identity(6, 6);
 
-  vector_t jointAccel = centroidal_model::getJointVelocities(inputDesired - inputLast_, info_) / period;
-  inputLast_ = inputDesired;
-  mapping_.setPinocchioInterface(pinocchioInterfaceDesired_);
+  Vector6 b = Vector6::Zero();
 
-  const auto& model = pinocchioInterfaceDesired_.getModel();
-  auto& data = pinocchioInterfaceDesired_.getData();
-  const auto qDesired = mapping_.getPinocchioJointPosition(stateDesired);
-  const vector_t vDesired = mapping_.getPinocchioJointVelocity(stateDesired, inputDesired);
+  if (useBaseCentroidalAccel_) {
+    vector_t jointAccel = vector_t::Zero(info_.actuatedDofNum);
+    if (std::isfinite(period) && period > 1e-6) {
+      jointAccel = centroidal_model::getJointVelocities(inputDesired - inputLast_, info_) / period;
+    }
+    inputLast_ = inputDesired;
+    mapping_.setPinocchioInterface(pinocchioInterfaceDesired_);
 
-  const auto& A = getCentroidalMomentumMatrix(pinocchioInterfaceDesired_);
-  const Matrix6 Ab = A.template leftCols<6>();
-  const auto AbInv = computeFloatingBaseCentroidalMomentumMatrixInverse(Ab);
-  const auto Aj = A.rightCols(info_.actuatedDofNum);
-  const auto ADot = pinocchio::dccrba(model, data, qDesired, vDesired);
-  Vector6 centroidalMomentumRate = info_.robotMass * getNormalizedCentroidalMomentumRate(pinocchioInterfaceDesired_, info_, inputDesired);
-  centroidalMomentumRate.noalias() -= ADot * vDesired;
-  centroidalMomentumRate.noalias() -= Aj * jointAccel;
+    const auto& model = pinocchioInterfaceDesired_.getModel();
+    auto& data = pinocchioInterfaceDesired_.getData();
+    const auto qDesired = mapping_.getPinocchioJointPosition(stateDesired);
+    const vector_t vDesired = mapping_.getPinocchioJointVelocity(stateDesired, inputDesired);
 
-  Vector6 b = AbInv * centroidalMomentumRate;
+    const auto& A = getCentroidalMomentumMatrix(pinocchioInterfaceDesired_);
+    const Matrix6 Ab = A.template leftCols<6>();
+    const auto AbInv = computeFloatingBaseCentroidalMomentumMatrixInverse(Ab);
+    const auto Aj = A.rightCols(info_.actuatedDofNum);
+    const auto ADot = pinocchio::dccrba(model, data, qDesired, vDesired);
+    Vector6 centroidalMomentumRate = info_.robotMass * getNormalizedCentroidalMomentumRate(pinocchioInterfaceDesired_, info_, inputDesired);
+    centroidalMomentumRate.noalias() -= ADot * vDesired;
+    centroidalMomentumRate.noalias() -= Aj * jointAccel;
+
+    if (centroidalMomentumRate.allFinite()) {
+      const Vector6 centroidalBaseAccel = AbInv * centroidalMomentumRate;
+      if (centroidalBaseAccel.allFinite()) {
+        b += centroidalBaseAccel;
+      }
+    }
+  }
+
+  if (useBasePoseFeedback_) {
+    const vector3_t positionError = qDesired_.head<3>() - qMeasured_.head<3>();
+    const vector3_t linearVelocityError = vDesired_.head<3>() - vMeasured_.head<3>();
+    b.head<3>() += baseMotionKpPosition_ * positionError + baseMotionKdPosition_ * linearVelocityError;
+  }
+
+  b.head<2>() += upperLayerAccel_.head<2>();
+
+  if (!b.allFinite()) {
+    b.setZero();
+  }
 
   return {a, b, matrix_t(), vector_t()};
 }
@@ -265,6 +295,25 @@ void WbcBase::loadTasksSetting(const std::string& taskFile, bool verbose) {
   }
   loadData::loadPtreeValue(pt, swingKp_, prefix + "kp", verbose);
   loadData::loadPtreeValue(pt, swingKd_, prefix + "kd", verbose);
+
+  prefix = "baseMotionTrackingTask.";
+  if (const auto kp = pt.get_optional<scalar_t>(prefix + "kpPosition")) {
+    baseMotionKpPosition_ = *kp;
+  }
+  if (const auto kd = pt.get_optional<scalar_t>(prefix + "kdPosition")) {
+    baseMotionKdPosition_ = *kd;
+  }
+  if (const auto useCentroidal = pt.get_optional<bool>(prefix + "useCentroidalAccel")) {
+    useBaseCentroidalAccel_ = *useCentroidal;
+  }
+  if (const auto usePoseFeedback = pt.get_optional<bool>(prefix + "usePoseFeedback")) {
+    useBasePoseFeedback_ = *usePoseFeedback;
+  }
+  if (verbose) {
+    std::cerr << "\n #### Base Motion Tracking Task:";
+    std::cerr << "\n ####   kpPosition=" << baseMotionKpPosition_ << " kdPosition=" << baseMotionKdPosition_;
+    std::cerr << "\n ####   useCentroidalAccel=" << useBaseCentroidalAccel_ << " usePoseFeedback=" << useBasePoseFeedback_ << "\n";
+  }
 }
 
 }  // namespace legged

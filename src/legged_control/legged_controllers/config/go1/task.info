@@ -299,10 +299,18 @@ swingLegTask
     kd                   37
 }
 
+baseMotionTrackingTask
+{
+    kpPosition          15.0
+    kdPosition          5.0
+    useCentroidalAccel  true
+    usePoseFeedback     true
+}
+
 weight
 {
     swingLeg        100
-    baseAccel       1
+    baseAccel       3
     contactForce    0.01
 }
 
