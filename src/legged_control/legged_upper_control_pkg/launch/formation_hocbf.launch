@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="debug_frame_id" default="map"/>
+    <arg name="debug_publish_enabled" default="true"/>
+    <arg name="gazebo_world_path" default="$(find legged_gazebo)/worlds/obstacle_world.world"/>
+
+    <!-- Fleet manager (modularized version) -->
+    <node pkg="legged_upper_control"
+          type="fleet_manager_node.py"
+          name="fleet_manager"
+          output="screen">
+        <rosparam file="$(find legged_upper_control)/config/Cbf_params_twoOrderCBF.yaml"
+                  command="load"/>
+        <param name="debug_frame_id" value="$(arg debug_frame_id)"/>
+        <param name="debug_publish_enabled" value="$(arg debug_publish_enabled)"/>
+    </node>
+
+    <!-- Debug visualizer (still from legged_controllers) -->
+    <node pkg="legged_controllers"
+          type="formation_debug_visualizer.py"
+          name="formation_debug_visualizer"
+          output="screen">
+        <param name="config_path"
+               value="$(find legged_upper_control)/config/Cbf_params_twoOrderCBF.yaml"/>
+        <param name="debug_frame_id" value="$(arg debug_frame_id)"/>
+        <param name="gazebo_world_path" value="$(arg gazebo_world_path)"/>
+    </node>
+</launch>
