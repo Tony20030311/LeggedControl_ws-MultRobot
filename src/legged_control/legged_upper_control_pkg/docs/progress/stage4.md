@@ -64,14 +64,32 @@ OCS2 的 `(yaw−yaw_ref)²` 成本在 ±π 看到 2π 假跳、誤判要倒轉�
 `stage4_adapter.png` 三 panel:(a) 路徑+yaw 箭頭(頭朝移動方向)、(b) yaw(t) EMA vs 原始 atan2、
 (c) ±180° 穿越 EMA 連續 vs 原始跳變。
 
-## 未做(接線,獨立下一步)
-- **薄 rospy 發佈節點** `ocs2_target_publisher.py`:訂 observation → `MotionAdapter.adapt` → 發 target。
-  **adapter 核心不動**。
-- **3 rung 上 Gazebo**:rung 0 手搓 trivial 直線 target 驗純鏈路(不接 ADMM)、rung 1 單狗 ADMM、
-  rung 2 三狗編隊。
-- `COM_HEIGHT`/`DEFAULT_JOINT_STATES` 從 `reference.info` 載入(現用 placeholder 0.30 + A1 站姿)。
-- idx9 吃 wrapped 還是 continuous、seed 從實測 base yaw 錨定 —— Gazebo 行為確認。
-- input_dim 從 OCS2 info 確認(現預設 24)。
+## 接線 rung 0(純鏈路,不接 ADMM)= 通過 ✅
+
+新增 `scripts/ocs2_target_publisher.py`(薄 rospy 殼:訂 observation → 手搓 trivial 直線 target →
+發 `ocs2_msgs/mpc_target_trajectories`;呼叫 `pad_ocs2_state`,**adapter 核心不動、rospy-free**)。
+trivial target = 沿狗**實測 base yaw**方向等速前進(target yaw = 實測 yaw → 零轉頭指令,隔離最乾淨)。
+
+**⚠️ 關鍵 gotcha(topic 名)**:`load_controller_multi.launch:22,70,79` 把 OCS2 `robot_name` 設成
+**`ns`=dog1(非 "legged_robot")**→ 真實 topic 是 **`/dogN/dogN_mpc_target`** / `/dogN/dogN_mpc_observation`。
+publisher `~robot_name` 預設取 dog 名。發 target 前先 `rostopic list` 確認,否則 topic 對不上狗完全不動。
+
+**單狗 bring-up 順序**(容器,ROS+devel sourced):`gazebo_ros empty_world gui:=false` →
+`single_dog.launch ns:=dog1 init_x:=0`(spawn)→ `load_controller_multi.launch ns:=dog1`(controllers 只
+load 成 initialized)→ `switch_controller start joint_state+legged`(→running,obs ~1kHz)→
+`gait_broadcaster.py`(一次性發 trot mode_schedule,須 controller up 後才 connections>0)→ 零 cmd_vel
+pulse 站起(z 0.057→0.31)→ **kill `/dog1/legged_robot_target`**(C++ target 節點,清乾淨)→ 跑 publisher。
+`start_fleet.sh` 是 3 狗硬迴圈+`set -e`,單狗不能直用。
+
+**四項判定全過**:my target @10Hz(publisher=`/ocs2_target_publisher`)、state_dim=24、n_inputs=0、
+times[0]>obs.time、legged_controller 全程 running 無維度炸(#49)、**狗照 target 走 +x,px +1.13m/7.8s,
+vx_avg=0.144≈指令 0.15 m/s**,站立 z=0.303 直走不轉。
+
+## 未做(接線,之後繼續)
+- **rung 1 單狗 ADMM**:把 trivial target 換成 coordinator 單狗 ξ(seed 從 obs.state[9] 實測錨定)。
+- **rung 2 三狗編隊**:鏈通後上 3 狗驗 ADMM 編隊在真物理下。
+- `COM_HEIGHT`/`DEFAULT_JOINT_STATES` 從 `reference.info` 載入(rung 0 用 placeholder 0.30 + A1 站姿,已可站可走)。
+- idx9 wrapped vs continuous、input_dim(rung 0 送空 input 已 OK)—— 隨 rung 1+ 再確認。
 
 ## 環境限制
 `verify_stage4.py` 在容器 `5cdd1d8f092e` 跑(osqp 0.6.3 + matplotlib);`test_motion_adapter.py` rospy-free、
