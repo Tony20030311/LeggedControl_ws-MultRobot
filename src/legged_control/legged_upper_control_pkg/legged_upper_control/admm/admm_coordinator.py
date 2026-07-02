@@ -41,17 +41,27 @@ def consensus_target(z, lam, i, neighbors):
 
 
 class ADMMCoordinator:
-    def __init__(self, p_iters=None, rho=None, dogs=(1, 2), edges=((1, 2),)):
+    def __init__(self, p_iters=None, rho=None, dogs=(1, 2), edges=((1, 2),),
+                 formation=None, w_form=0.0, obstacles=None, walls=None):
         self.rho = C.RHO if rho is None else float(rho)
         self.P = C.P_ITERS if p_iters is None else int(p_iters)
         self.dogs = list(dogs)
         self.edges = [tuple(e) for e in edges]
+        # DI: LaplacianFormation (or None) injected by the verify script so the
+        # coordinator stays rospy-free; w_form scales the node formation term.
+        self.formation = formation
+        self.w_form = float(w_form)
+        # node-local obstacle/wall CBF: re-enabled in stage 3 (empty in stage 2).
+        self.obstacles = list(obstacles or [])
+        self.walls = list(walls or [])
         self.neighbors = {i: [b if a == i else a for (a, b) in self.edges if i in (a, b)]
                           for i in self.dogs}
-        # node: obstacles/walls empty in stage 2 (isolate the splitting); consensus on
-        self.node = {i: nq.NodeSubproblem(obstacles=[], walls=[],
+        # node: obstacle/wall CBF (dormant in stage 2 = empty; fed in stage 3),
+        # consensus on, formation weight w_form (0 -> off).
+        self.node = {i: nq.NodeSubproblem(obstacles=self.obstacles, walls=self.walls,
                                           rho_consensus=self.rho,
-                                          n_neighbors=len(self.neighbors[i]))
+                                          n_neighbors=len(self.neighbors[i]),
+                                          w_form=self.w_form)
                      for i in self.dogs}
         self.edge = {e: es.EdgeSubproblem(rho=self.rho) for e in self.edges}
         self.N = self.node[self.dogs[0]].N
@@ -82,6 +92,24 @@ class ADMMCoordinator:
             worst = max(worst, float(max(0.0, -hb.min())))
         return worst
 
+    def _formation_grad(self, xibar):
+        """Freeze dphi/dp_i for every dog and horizon step (B8: once per cycle,
+        OUTSIDE the ADMM loop). Operating point = the true-body xibar; step k
+        gathers all dogs' predicted position at k and asks the injected
+        core.formation for the per-dog gradient. Returns {i: (N,2)} RAW (no
+        w_form here -- the node's _q folds w_form in). Formation is all-to-all:
+        every dog's grad depends on all others' positions at step k, which is why
+        it is a frozen node-local term, never an edge (spec B4)."""
+        N = self.N
+        grad = {i: np.zeros((N, 2)) for i in self.dogs}
+        for k in range(1, N + 1):
+            pos_k = [xibar[i][C.px_index(k, N):C.px_index(k, N) + 2]
+                     for i in self.dogs]
+            _f, glist = self.formation.compute(pos_k)
+            for idx, i in enumerate(self.dogs):
+                grad[i][k - 1] = np.asarray(glist[idx], float)
+        return grad
+
     def step(self, xnow, xdes):
         """One control cycle. xnow[i]=state4, xdes[i]=(N,4). Returns (xi, hist)."""
         nz = self.nz
@@ -101,6 +129,11 @@ class ADMMCoordinator:
             frozen = rti.linearize_edge(xibar[a], xibar[b], xnow[a], xnow[b], self.N)
             self.edge[(a, b)].set_linearization(frozen)
 
+        # 2b. freeze the formation gradient ONCE too (B8). cycle 0's xibar is the
+        # uncoupled z0 (no formation info) -> skip, formation off (spec detail 3).
+        fgrad = (self._formation_grad(xibar)
+                 if (self.formation is not None and self.cycle > 0) else None)
+
         # 3. ADMM loop (fixed P_ITERS, no wait-for-convergence)
         xi = {i: xibar[i].copy() for i in self.dogs}
         hist = {"r_prim": [], "r_dual": [], "h2_viol": []}
@@ -109,7 +142,9 @@ class ADMMCoordinator:
             # node update (parallel over dogs)
             for i in self.dogs:
                 ct = consensus_target(z, lam, i, self.neighbors[i])
-                r = self.node[i].solve(xnow[i], xdes[i], xbar=xibar[i], consensus_target=ct)
+                fg = fgrad[i] if fgrad is not None else None
+                r = self.node[i].solve(xnow[i], xdes[i], xbar=xibar[i],
+                                       consensus_target=ct, formation_grad=fg)
                 xi[i] = np.asarray(r["xi"], float)[:nz].copy()
             # edge update (parallel over edges)
             for (a, b) in self.edges:

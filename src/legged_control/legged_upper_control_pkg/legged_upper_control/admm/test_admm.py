@@ -72,3 +72,25 @@ def test_residual_keys_present():
     for k in ("r_prim", "r_dual", "h2_viol"):
         assert k in hist and len(hist[k]) == 3
         assert all(np.isfinite(v) for v in hist[k])
+
+
+def test_three_dog_wiring_generic():
+    """Stage 3 (change A): the complete 3-graph must wire with NO two-dog
+    assumption -- each node has exactly 2 neighbors, z/lam are stored per edge with
+    both endpoints, and one full ADMM cycle runs over all 3 edges. This is why
+    change A needs no structural edit to the coordinator."""
+    coord = ac.ADMMCoordinator(dogs=(1, 2, 3),
+                               edges=((1, 2), (1, 3), (2, 3)), p_iters=2)
+    assert coord.neighbors == {1: [2, 3], 2: [1, 3], 3: [1, 2]}
+    xnow = {1: np.array([-1.0, 0.6, 0.0, 0.0]),
+            2: np.array([-1.0, -0.6, 0.0, 0.0]),
+            3: np.array([-1.7, 0.0, 0.0, 0.0])}
+    xdes = {i: ref.build_reference(
+                xnow[i][:2], [xnow[i][:2], xnow[i][:2] + np.array([3.0, 0.0])])
+            for i in (1, 2, 3)}
+    xi, hist = coord.step(xnow, xdes)
+    assert set(coord.prev_z.keys()) == {(1, 2), (1, 3), (2, 3)}
+    for e in ((1, 2), (1, 3), (2, 3)):
+        assert set(coord.prev_z[e].keys()) == set(e)
+    assert set(xi.keys()) == {1, 2, 3}
+    assert len(hist["r_prim"]) == 2

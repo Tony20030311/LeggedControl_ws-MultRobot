@@ -66,7 +66,7 @@ class NodeSubproblem:
 
     def __init__(self, obstacles=None, walls=None, robot_margin=0.30,
                  q_pos=10.0, q_v=1.0, r_accel=0.5, w_pred=20.0, n=None,
-                 rho_consensus=0.0, n_neighbors=0):
+                 rho_consensus=0.0, n_neighbors=0, w_form=0.0):
         self.N = C.N if n is None else int(n)
         N = self.N
         self.n_xi = C.xi_dim(N)                       # 6N
@@ -81,6 +81,8 @@ class NodeSubproblem:
         # Default off (rho_consensus=0) -> identical to the stage-1 node QP.
         self.rho_consensus = float(rho_consensus)
         self.n_neighbors = int(n_neighbors)
+        # ADMM node cost formation linear-term weight (0 -> off, bit-identical).
+        self.w_form = float(w_form)
 
         n_feat = len(self.obstacles) + len(self.walls)
         # CBF accel-steps k = 0..N-2 (need state x_{k+2}); k=0 hard, k>=1 soft.
@@ -206,7 +208,7 @@ class NodeSubproblem:
         return sp.diags(diag).tocsc()
 
     # ---- per-cycle assembly ----
-    def _q(self, x_des, consensus_target=None):
+    def _q(self, x_des, consensus_target=None, formation_grad=None):
         """Linear term: -2 Q x_des (position only), -2 P_term x_des at terminal,
         and the ADMM consensus term -rho * sum_j(z^{ij,i}-lambda^{ij,i}) on the xi
         block (文件二 C4.2). consensus_target = sum_j(z^{ij,i}-lambda^{ij,i}) (6N)."""
@@ -220,6 +222,14 @@ class NodeSubproblem:
         # terminal velocity target is 0 -> no linear term
         if consensus_target is not None and self.rho_consensus > 0.0:
             q[:self.n_xi] += -self.rho_consensus * np.asarray(consensus_target, float)
+        # formation (文件二 C4): formation_grad[k-1] is the LINEARIZED gradient
+        # dphi/dp_i (first-order Taylor coef), so it enters q as a BARE +w_form*g
+        # -- NOT -2Q (that sign comes from expanding ||x-x_des||^2; formation has
+        # no such square). Position dims only; Hessian untouched. cycle 0 -> None.
+        if formation_grad is not None and self.w_form > 0.0:
+            for k in range(1, N + 1):
+                q[C.px_index(k, N)] += self.w_form * formation_grad[k - 1, 0]
+                q[C.py_index(k, N)] += self.w_form * formation_grad[k - 1, 1]
         return q
 
     def _operating_point(self, x_now, xbar):
@@ -295,7 +305,8 @@ class NodeSubproblem:
             lo[entry["row"]] = -np.inf
         return lo, up
 
-    def solve(self, x_now, x_des, xbar=None, consensus_target=None):
+    def solve(self, x_now, x_des, xbar=None, consensus_target=None,
+              formation_grad=None):
         """One node QP. Returns dict(status, xi, x_pred(N,4), a_pred(N,2), a0).
 
         Steady state (xbar given): one hard pass linearized at xbar. Cold start
@@ -307,7 +318,7 @@ class NodeSubproblem:
         """
         N = self.N
         x_now = np.asarray(x_now, dtype=float)
-        q = self._q(x_des, consensus_target)
+        q = self._q(x_des, consensus_target, formation_grad)
 
         op = self._operating_point(x_now, xbar)
         if op is None:                                # cold start: soft warm-up
