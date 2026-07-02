@@ -18,6 +18,38 @@ import constants as C          # noqa: E402
 import node_subproblem as nq   # noqa: E402
 
 
+def test_node_consensus_term():
+    """Node update (19): consensus adds rho*|N(i)| to the xi Hessian diagonal and
+    -rho*sum_j(z^{ij,i}-lambda^{ij,i}) to the xi linear term. Slacks and every
+    off-diagonal entry untouched (consensus couples nothing new; it is not a var)."""
+    N = C.N
+    xi = C.xi_dim(N)
+    obs = [{"pos": (2.0, 0.4), "radius": 0.35}]
+    base = nq.NodeSubproblem(obstacles=obs, walls=[])
+    cons = nq.NodeSubproblem(obstacles=obs, walls=[], rho_consensus=C.RHO, n_neighbors=1)
+    assert cons.nvar == base.nvar                      # same layout
+    dP = np.asarray((cons._P - base._P).todense())
+    assert np.allclose(np.diag(dP)[:xi], C.RHO)        # +rho*n_nbr on xi diagonal (n_nbr=1)
+    assert np.allclose(np.diag(dP)[xi:], 0.0)          # slack diagonal untouched
+    assert np.allclose(dP - np.diag(np.diag(dP)), 0.0)  # nothing off-diagonal
+    x_des = np.zeros((N, 4))
+    target = np.arange(xi, dtype=float) + 1.0
+    dq = cons._q(x_des, consensus_target=target) - cons._q(x_des)
+    assert np.allclose(dq[:xi], -C.RHO * target)       # -rho * sum_j(z-lambda) on xi block
+    assert np.allclose(dq[xi:], 0.0)                   # slacks untouched
+
+
+def test_node_consensus_off_by_default():
+    """rho_consensus defaults to 0 -> P and q identical to a plain node. Unit-level
+    stage-1 regression guard (the byte-identical closed loop is verify_stage1.py)."""
+    obs = [{"pos": (2.0, 0.4), "radius": 0.35}]
+    a = nq.NodeSubproblem(obstacles=obs, walls=[])
+    b = nq.NodeSubproblem(obstacles=obs, walls=[], rho_consensus=0.0, n_neighbors=0)
+    assert np.allclose(np.asarray((a._P - b._P).todense()), 0.0)
+    x_des = np.zeros((C.N, 4))
+    assert np.allclose(a._q(x_des), b._q(x_des))
+
+
 def test_dimensions():
     node = nq.NodeSubproblem(obstacles=[{"pos": (2.0, 0.4), "radius": 0.35}],
                              walls=[], n=C.N)

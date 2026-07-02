@@ -65,7 +65,8 @@ class NodeSubproblem:
     """Single-dog node QP over the 6N decision vector + soft-CBF slacks."""
 
     def __init__(self, obstacles=None, walls=None, robot_margin=0.30,
-                 q_pos=10.0, q_v=1.0, r_accel=0.5, w_pred=20.0, n=None):
+                 q_pos=10.0, q_v=1.0, r_accel=0.5, w_pred=20.0, n=None,
+                 rho_consensus=0.0, n_neighbors=0):
         self.N = C.N if n is None else int(n)
         N = self.N
         self.n_xi = C.xi_dim(N)                       # 6N
@@ -76,6 +77,10 @@ class NodeSubproblem:
         self.robot_margin = float(robot_margin)
         self.q_pos, self.q_v = float(q_pos), float(q_v)
         self.r_accel, self.w_pred = float(r_accel), float(w_pred)
+        # ADMM node update (19) consensus penalty (rho/2) sum_{j in N(i)} ||xi - c^ij||^2.
+        # Default off (rho_consensus=0) -> identical to the stage-1 node QP.
+        self.rho_consensus = float(rho_consensus)
+        self.n_neighbors = int(n_neighbors)
 
         n_feat = len(self.obstacles) + len(self.walls)
         # CBF accel-steps k = 0..N-2 (need state x_{k+2}); k=0 hard, k>=1 soft.
@@ -194,11 +199,17 @@ class NodeSubproblem:
             diag[C.ay_index(k, N)] = 2.0 * self.r_accel
         for j in range(self.n_slack):                 # slacks
             diag[self.n_xi + j] = 2.0 * self.w_pred
+        # consensus (19): +rho*|N(i)| on the whole xi block (H += rho|N(i)| I_{6N},
+        # 文件二 C4.1). (rho/2)||xi-c||^2 -> Hessian rho; slacks/off-diagonal untouched.
+        if self.rho_consensus > 0.0 and self.n_neighbors > 0:
+            diag[:self.n_xi] += self.rho_consensus * self.n_neighbors
         return sp.diags(diag).tocsc()
 
     # ---- per-cycle assembly ----
-    def _q(self, x_des):
-        """Linear term: -2 Q x_des (position only), -2 P_term x_des at terminal."""
+    def _q(self, x_des, consensus_target=None):
+        """Linear term: -2 Q x_des (position only), -2 P_term x_des at terminal,
+        and the ADMM consensus term -rho * sum_j(z^{ij,i}-lambda^{ij,i}) on the xi
+        block (文件二 C4.2). consensus_target = sum_j(z^{ij,i}-lambda^{ij,i}) (6N)."""
         N = self.N
         q = np.zeros(self.nvar)
         for k in range(1, N):
@@ -207,6 +218,8 @@ class NodeSubproblem:
         q[C.px_index(N, N)] = -2.0 * 10.0 * self.q_pos * x_des[N - 1, 0]
         q[C.py_index(N, N)] = -2.0 * 10.0 * self.q_pos * x_des[N - 1, 1]
         # terminal velocity target is 0 -> no linear term
+        if consensus_target is not None and self.rho_consensus > 0.0:
+            q[:self.n_xi] += -self.rho_consensus * np.asarray(consensus_target, float)
         return q
 
     def _operating_point(self, x_now, xbar):
@@ -282,16 +295,19 @@ class NodeSubproblem:
             lo[entry["row"]] = -np.inf
         return lo, up
 
-    def solve(self, x_now, x_des, xbar=None):
+    def solve(self, x_now, x_des, xbar=None, consensus_target=None):
         """One node QP. Returns dict(status, xi, x_pred(N,4), a_pred(N,2), a0).
 
         Steady state (xbar given): one hard pass linearized at xbar. Cold start
         (xbar is None): a soft warm-up pass (k=0 hard rows dropped) yields a
         curved operating point, then the real hard pass linearizes there.
+
+        consensus_target (ADMM node update 19): sum_j(z^{ij,i}-lambda^{ij,i}) (6N);
+        adds -rho*consensus_target to the xi linear term. None -> no consensus.
         """
         N = self.N
         x_now = np.asarray(x_now, dtype=float)
-        q = self._q(x_des)
+        q = self._q(x_des, consensus_target)
 
         op = self._operating_point(x_now, xbar)
         if op is None:                                # cold start: soft warm-up

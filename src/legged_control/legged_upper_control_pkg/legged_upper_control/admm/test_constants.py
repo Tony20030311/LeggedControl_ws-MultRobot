@@ -81,3 +81,13 @@ def test_index_formulas_scale_with_n():
     # N=10 must relocate the accel block — guards against a hardcoded 80
     assert C.a_index(0, n=10) == 40 and C.xi_dim(10) == 60
     assert C.a_index(0, n=20) == 80
+
+
+# --- stage 2: ADMM / edge-QP constants (spec_updates_v2 A/E; Tony-approved) ----
+def test_admm_edge_constants():
+    assert abs(C.RHO - 20.0) < 1e-9           # ADMM penalty, fixed (spec: no adapt)
+    assert abs(C.SLACK_LAMBDA - 5.0) < 1e-9   # phi(s) = lambda_slk s^2 (paper Eq.13)
+    assert abs(C.D_MIN - 0.6) < 1e-9          # inter-agent min separation [m]
+    assert C.P_ITERS == 20                    # fixed ADMM iters (no wait-for-convergence)
+    # all strictly positive -> consensus penalty PSD, edge slack penalty PSD, d^2>0
+    assert C.RHO > 0 and C.SLACK_LAMBDA > 0 and C.D_MIN > 0 and C.P_ITERS > 0

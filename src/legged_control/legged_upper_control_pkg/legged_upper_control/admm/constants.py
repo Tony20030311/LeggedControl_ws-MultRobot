@@ -78,6 +78,15 @@ A_TO_P1_COEF = 0.5 * TS**2       # a_k -> p_{k+1} exact coef = 1/2 Ts^2 = 0.005
 CBF_CONSTR_COEF_P1 = 2.0 * A_TO_P1_COEF  # obstacle h_{k+1} grad (2e) = Ts^2 = 0.01
 
 
+# --- stage 2: ADMM / edge-QP constants (spec_updates_v2 A/E; Tony-approved) -----
+# Not derived from N/Ts/gamma — these are tuning parameters (spec F "待驗證清單").
+# Single source here so the node consensus term and the edge QP never hardcode them.
+RHO = 20.0          # ADMM penalty rho (fixed; spec: no wait-for-convergence / no adapt)
+SLACK_LAMBDA = 5.0  # edge slack penalty: phi(s) = SLACK_LAMBDA * s^2 (paper Eq.13)
+D_MIN = 0.6         # inter-agent minimum center separation [m] (edge CBF: ||p^i-p^j||^2 - D_MIN^2)
+P_ITERS = 20        # ADMM iterations per control cycle (fixed 15-20, no convergence stop)
+
+
 # --- decision-vector index formulas (文件二 全局設定; 0-based) ------------------
 # xi = [ x_1 .. x_N  (4N) ,  a_0 .. a_{N-1}  (2N) ]
 # States use k = 1..N (x_0 is the measured initial condition, not a variable).
