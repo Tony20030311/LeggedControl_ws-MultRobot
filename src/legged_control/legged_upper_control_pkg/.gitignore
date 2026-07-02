@@ -1,0 +1,6 @@
+# external open-source reference clones (own .git history, ~171MB) -- reference
+# only, never a copy-paste target; do not commit into this repo
+references/
+
+# local Claude Code hooks / settings
+.claude/
