@@ -104,12 +104,44 @@ def yaw_trajectory(vx_arr, vy_arr, seed_yaw, v_freeze, ema_alpha):
     return yaws
 
 
+def yaw_trajectory_path(px_arr, py_arr, seed_yaw, lookahead_M, pos_eps, ema_alpha):
+    """Route B yaw: head along the PLANNED PATH (position lookahead), not the
+    instantaneous velocity. yaw_k = atan2(p[k+M]-p[k]) over the SAME ξ positions.
+
+    Why this kills the orbit that yaw_trajectory (velocity direction) causes: near
+    the goal the toward-goal velocity -> 0 but the trot sway residual keeps rotating,
+    so a velocity-direction yaw chases the sway -> body turns -> world velocity turns
+    -> positive feedback -> orbit. A position lookahead is dominated by the (smooth,
+    goal-directed, decelerating) path shape and averages the per-step sway out; when
+    the trajectory has essentially stopped (‖p[k+M]-p[k]‖ < pos_eps) we FREEZE the
+    heading instead of pointing at a vanishing-then-noisy direction -- that freeze is
+    what breaks the residual->turn feedback chain.
+
+    Same continuity contract as yaw_step: wrap only the INCREMENT and accumulate onto
+    a continuous heading (may pass ±π), seed from the measured base yaw each cycle."""
+    n = len(px_arr)
+    yaws = np.zeros(n)
+    prev = seed_yaw
+    for k in range(n):
+        j = min(k + lookahead_M, n - 1)          # clamp lookahead to horizon end
+        dx = px_arr[j] - px_arr[k]
+        dy = py_arr[j] - py_arr[k]
+        if math.hypot(dx, dy) < pos_eps:
+            raw = prev                            # trajectory ~stopped -> hold heading
+        else:
+            raw = math.atan2(dy, dx)
+        prev = prev + ema_alpha * wrap_to_pi(raw - prev)   # continuous accumulate
+        yaws[k] = prev
+    return yaws
+
+
 class MotionAdapter:
     """Holds the padding config + per-dog yaw seed; turns one ADMM ξ into an OCS2
     target trajectory (times, states, zero inputs)."""
 
     def __init__(self, com_height, default_joints, n=None, ts=None,
-                 v_freeze=0.05, ema_alpha=0.3, input_dim=24):
+                 v_freeze=0.05, ema_alpha=0.3, input_dim=24,
+                 yaw_mode="path", lookahead_M=5, pos_eps=0.02):
         self.com_height = float(com_height)
         self.default_joints = np.asarray(default_joints, dtype=float)
         assert self.default_joints.shape == (N_JOINTS,), \
@@ -119,18 +151,31 @@ class MotionAdapter:
         self.v_freeze = float(v_freeze)
         self.ema_alpha = float(ema_alpha)
         self.input_dim = int(input_dim)
+        # yaw_mode: 'path' (Route B, position lookahead -- default, kills the orbit) or
+        # 'tangent' (legacy velocity direction; kept for arc mode + A/B diagnostics).
+        self.yaw_mode = yaw_mode
+        # ponytail: M=5 steps (0.5s @ 10Hz) / pos_eps=2cm are hardware knobs -- tune on
+        # Gazebo (exposed as ~lookahead_m / ~pos_eps params in the publisher).
+        self.lookahead_M = int(lookahead_M)
+        self.pos_eps = float(pos_eps)
         self._seed = {}                       # per-dog yaw seed (cross-cycle)
 
-    def build_target(self, xi, t0=0.0, seed_yaw=0.0):
+    def build_target(self, xi, t0=0.0, seed_yaw=0.0, yaw_mode=None):
         """ξ (6N) -> dict(times(N,), states(N,24), inputs(N,input_dim), next_seed).
-        State x_k (k=1..N) is sent at time t0 + k*Ts; accelerations are dropped."""
+        State x_k (k=1..N) is sent at time t0 + k*Ts; accelerations are dropped.
+        yaw_mode overrides self.yaw_mode for this call ('path' | 'tangent')."""
         N = self.N
         xi = np.asarray(xi, dtype=float)
         px = np.array([xi[C.px_index(k, N)] for k in range(1, N + 1)])
         py = np.array([xi[C.py_index(k, N)] for k in range(1, N + 1)])
         vx = np.array([xi[C.vx_index(k, N)] for k in range(1, N + 1)])
         vy = np.array([xi[C.vy_index(k, N)] for k in range(1, N + 1)])
-        yaws = yaw_trajectory(vx, vy, seed_yaw, self.v_freeze, self.ema_alpha)
+        mode = self.yaw_mode if yaw_mode is None else yaw_mode
+        if mode == "tangent":
+            yaws = yaw_trajectory(vx, vy, seed_yaw, self.v_freeze, self.ema_alpha)
+        else:                                 # 'path' (Route B, default)
+            yaws = yaw_trajectory_path(px, py, seed_yaw, self.lookahead_M,
+                                       self.pos_eps, self.ema_alpha)
 
         times = np.zeros(N)
         states = np.zeros((N, OCS2_STATE_DIM))
