@@ -4,6 +4,9 @@
     <arg name="ns"/>
     <arg name="cheater" default="false"/>
     <arg name="delay"   default="0"/>
+    <!-- use_admm_target:=true 時不啟動 C++ legged_robot_target,讓上層 ADMM publisher
+         獨佔 /<ns>/<ns>_mpc_target(避免兩個 publisher 打架)。預設 false = 現況不變。 -->
+    <arg name="use_admm_target" default="false"/>
 
     <group ns="$(arg ns)">
 
@@ -72,7 +75,9 @@
 
         <!-- ========== Target Trajectories Publisher ========== -->
         <!-- 把 cmd_vel / move_base_simple/goal 轉成 MPC target trajectory -->
-        <node pkg="legged_controllers"
+        <!-- use_admm_target:=true 時整個 node 不啟動(ADMM publisher 自己發 target) -->
+        <node unless="$(arg use_admm_target)"
+              pkg="legged_controllers"
               type="legged_target_trajectories_publisher"
               name="legged_robot_target"
               output="screen">
