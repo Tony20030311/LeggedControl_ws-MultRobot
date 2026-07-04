@@ -66,6 +66,12 @@ class OCS2TargetPublisher:
         self.lookahead_m = int(rospy.get_param("~lookahead_m", 5))    # path yaw lookahead steps
         self.pos_eps = float(rospy.get_param("~pos_eps", 0.02))       # near-goal freeze threshold [m]
         self._yaw0 = None                                        # frozen-yaw capture (rung1)
+        # goal-proximity yaw latch (same fix as the fleet publisher): near the goal the
+        # path-lookahead direction is noise, so the measured-yaw-seeded yaw winds up
+        # unboundedly (dog spins). Latch the arrival heading within r, release past r+margin.
+        self.yaw_latch_r = float(rospy.get_param("~yaw_latch_r", 0.25))
+        self.yaw_latch_margin = float(rospy.get_param("~yaw_latch_margin", 0.10))
+        self._yaw_latch = None                                   # held heading, or None
         self.N, self.ts = C.N, C.TS
         self.obs = None
         self._logged_first = False
@@ -308,6 +314,18 @@ class OCS2TargetPublisher:
                 self._yaw0 = s[ma.BASE_YAW]
             for st in states:
                 st[ma.BASE_YAW] = self._yaw0
+        elif self.yaw_mode == "path":
+            # goal-proximity yaw latch (hysteresis) -- freeze heading near the goal so the
+            # near-goal path-yaw feedback can't wind up (see fleet publisher for the trace).
+            d_goal = float(np.hypot(P0[0] - self.goal[0], P0[1] - self.goal[1]))
+            if self._yaw_latch is None:
+                if d_goal < self.yaw_latch_r:
+                    self._yaw_latch = s[ma.BASE_YAW]
+            elif d_goal > self.yaw_latch_r + self.yaw_latch_margin:
+                self._yaw_latch = None
+            if self._yaw_latch is not None:
+                for st in states:
+                    st[ma.BASE_YAW] = self._yaw_latch
         return out["times"].tolist(), states
 
     def _log(self, obs, states):
