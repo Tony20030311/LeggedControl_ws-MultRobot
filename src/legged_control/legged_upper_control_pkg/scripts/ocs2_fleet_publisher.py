@@ -85,6 +85,14 @@ class FleetPublisher:
                                         lookahead_M=int(rospy.get_param("~lookahead_m", 5)),
                                         pos_eps=float(rospy.get_param("~pos_eps", 0.02)))
 
+        # goal-proximity yaw latch: near its slot a dog isn't really travelling, so the
+        # path-lookahead direction is noise -> the measured-yaw-seeded feedback winds the
+        # yaw up unboundedly (dog spins, trot topples). Latch the arrival heading within
+        # r_latch, release past r_latch+margin (hysteresis). Breaks the loop at the goal.
+        self.r_latch = float(rospy.get_param("~yaw_latch_r", 0.25))
+        self.latch_margin = float(rospy.get_param("~yaw_latch_margin", 0.10))
+        self._yaw_latch = {i: None for i in self.dogs}   # held heading, or None
+
         self.obs = {i: None for i in self.dogs}
         self.gt = {i: None for i in self.dogs}
         self._v_ema = {i: None for i in self.dogs}   # per-dog EMA of X0 velocity
@@ -108,8 +116,8 @@ class FleetPublisher:
             self._csv.write("# fleet rung2 formation=%s w_form=%.1f v=%.3f goals=%s\n"
                             % (self.formation_name, self.w_form, self.v,
                                {i: self.goal[i].tolist() for i in self.dogs}))
-            self._csv.write("t," + ",".join("gt%d_x,gt%d_y,yaw%d,cmd_yaw%d" % (i, i, i, i)
-                                            for i in self.dogs) + "\n")
+            self._csv.write("t," + ",".join("%s%d" % (c, i) for i in self.dogs
+                                            for c in self._DBG_COLS) + "\n")
             rospy.on_shutdown(lambda: self._csv and self._csv.close())
         except IOError as e:
             rospy.logwarn("[fleet_pub] cannot open log %s: %s", self._csv_path, e)
@@ -158,7 +166,7 @@ class FleetPublisher:
             rospy.logwarn_throttle(2.0, "[fleet_pub] coord.step failed: %s", e)
             return
 
-        cmd_yaw = {}
+        dbg = {}
         for i in self.dogs:
             s = self.obs[i].state.value
             xi_i = np.asarray(xi[i], float)
@@ -173,10 +181,26 @@ class FleetPublisher:
             out = self.adapter.build_target(xi_mpc, t0=self.obs[i].time,
                                             seed_yaw=s[ma.BASE_YAW], yaw_mode="path")
             states = [st.tolist() for st in out["states"]]
+            # goal-proximity yaw latch (hysteresis) -- freeze heading near the slot so the
+            # near-goal path-yaw feedback can't wind up.
+            d_goal = float(np.hypot(P0[i][0] - self.goal[i][0], P0[i][1] - self.goal[i][1]))
+            if self._yaw_latch[i] is None:
+                if d_goal < self.r_latch:
+                    self._yaw_latch[i] = s[ma.BASE_YAW]          # freeze the arrival heading
+            elif d_goal > self.r_latch + self.latch_margin:
+                self._yaw_latch[i] = None                        # left the slot -> steer again
+            if self._yaw_latch[i] is not None:
+                for st in states:
+                    st[ma.BASE_YAW] = self._yaw_latch[i]
             self.pub[i].publish(self._to_msg(out["times"].tolist(), states))
-            cmd_yaw[i] = states[0][ma.BASE_YAW]
+            # boundary instrumentation (which quantity diverges first):
+            dbg[i] = dict(estpx=s[ma.BASE_PX], estpy=s[ma.BASE_PY], dx=dx, dy=dy,
+                          obsvx=s[ma.MOM_LIN_X], obsvy=s[ma.MOM_LIN_Y],
+                          x0vx=xnow[i][2], x0vy=xnow[i][3],
+                          tgt1x=states[0][ma.BASE_PX], tgt1y=states[0][ma.BASE_PY],
+                          seed=s[ma.BASE_YAW], cmd=states[0][ma.BASE_YAW])
 
-        self._log(cmd_yaw)
+        self._log(dbg)
 
     def _to_msg(self, times, states):
         assert len(times) == len(states), "target time/state length mismatch"
@@ -186,14 +210,20 @@ class FleetPublisher:
         m.inputTrajectory = [mpc_input(value=[0.0] * 24) for _ in states]
         return m
 
-    def _log(self, cmd_yaw):
+    _DBG_COLS = ["gt_x", "gt_y", "estpx", "estpy", "dx", "dy",
+                 "obsvx", "obsvy", "x0vx", "x0vy", "tgt1x", "tgt1y", "seed", "cmd"]
+
+    def _log(self, dbg):
         if self._csv is None or self._csv.closed:   # Timer can fire after on_shutdown closes it
             return
         row = ["%.4f" % self.obs[self.dogs[0]].time]
         for i in self.dogs:
             gp = self.gt[i].pose.pose.position
-            yaw = self.obs[i].state.value[ma.BASE_YAW]
-            row += ["%.5f" % gp.x, "%.5f" % gp.y, "%.5f" % yaw, "%.5f" % cmd_yaw[i]]
+            d = dbg[i]
+            vals = [gp.x, gp.y, d["estpx"], d["estpy"], d["dx"], d["dy"],
+                    d["obsvx"], d["obsvy"], d["x0vx"], d["x0vy"],
+                    d["tgt1x"], d["tgt1y"], d["seed"], d["cmd"]]
+            row += ["%.5f" % v for v in vals]
         self._csv.write(",".join(row) + "\n")
         self._csv.flush()
 
