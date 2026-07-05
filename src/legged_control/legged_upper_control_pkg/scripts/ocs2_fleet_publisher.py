@@ -93,6 +93,14 @@ class FleetPublisher:
         self.latch_margin = float(rospy.get_param("~yaw_latch_margin", 0.10))
         self._yaw_latch = {i: None for i in self.dogs}   # held heading, or None
 
+        # dynamic safe-prefix truncation (edge handoff fix): each cycle send OCS2 only
+        # the leading steps of the plan that clear D_MIN(+margin) from every other dog;
+        # OCS2 clamps to the last (safe) sent point past that. Only k=0 is a HARD CBF
+        # step, so the ADMM plan itself dives unsafe at a close approach -- we hand over
+        # only the part we can vouch for. send_cap caps it at OCS2's ~1s horizon.
+        self.send_cap = int(rospy.get_param("~k_send", C.K_SEND))
+        self.d_safe = C.D_MIN + float(rospy.get_param("~send_margin", 0.0))
+
         self.obs = {i: None for i in self.dogs}
         self.gt = {i: None for i in self.dogs}
         self._v_ema = {i: None for i in self.dogs}   # per-dog EMA of X0 velocity
@@ -166,6 +174,12 @@ class FleetPublisher:
             rospy.logwarn_throttle(2.0, "[fleet_pub] coord.step failed: %s", e)
             return
 
+        # world-frame predicted positions per dog (for inter-agent safe-prefix truncation)
+        wpx = {i: np.array([xi[i][C.px_index(k, self.N)] for k in range(1, self.N + 1)])
+               for i in self.dogs}
+        wpy = {i: np.array([xi[i][C.py_index(k, self.N)] for k in range(1, self.N + 1)])
+               for i in self.dogs}
+
         dbg = {}
         for i in self.dogs:
             s = self.obs[i].state.value
@@ -177,9 +191,14 @@ class FleetPublisher:
             for k in range(1, self.N + 1):
                 xi_mpc[C.px_index(k, self.N)] += dx
                 xi_mpc[C.py_index(k, self.N)] += dy
+            # how many leading steps clear D_MIN from the other dogs (world frame)
+            others = [(wpx[j], wpy[j]) for j in self.dogs if j != i]
+            k_send = ma.safe_prefix_length(wpx[i], wpy[i], others,
+                                           self.d_safe, self.send_cap)
             # path yaw, seed = THIS dog's measured yaw (re-anchor each cycle, per rung 1)
             out = self.adapter.build_target(xi_mpc, t0=self.obs[i].time,
-                                            seed_yaw=s[ma.BASE_YAW], yaw_mode="path")
+                                            seed_yaw=s[ma.BASE_YAW], yaw_mode="path",
+                                            k_send=k_send)
             states = [st.tolist() for st in out["states"]]
             # goal-proximity yaw latch (hysteresis) -- freeze heading near the slot so the
             # near-goal path-yaw feedback can't wind up.
@@ -198,7 +217,7 @@ class FleetPublisher:
                           obsvx=s[ma.MOM_LIN_X], obsvy=s[ma.MOM_LIN_Y],
                           x0vx=xnow[i][2], x0vy=xnow[i][3],
                           tgt1x=states[0][ma.BASE_PX], tgt1y=states[0][ma.BASE_PY],
-                          seed=s[ma.BASE_YAW], cmd=states[0][ma.BASE_YAW])
+                          seed=s[ma.BASE_YAW], cmd=states[0][ma.BASE_YAW], ksend=k_send)
 
         self._log(dbg)
 
@@ -211,7 +230,7 @@ class FleetPublisher:
         return m
 
     _DBG_COLS = ["gt_x", "gt_y", "estpx", "estpy", "dx", "dy",
-                 "obsvx", "obsvy", "x0vx", "x0vy", "tgt1x", "tgt1y", "seed", "cmd"]
+                 "obsvx", "obsvy", "x0vx", "x0vy", "tgt1x", "tgt1y", "seed", "cmd", "ksend"]
 
     def _log(self, dbg):
         if self._csv is None or self._csv.closed:   # Timer can fire after on_shutdown closes it
@@ -222,7 +241,7 @@ class FleetPublisher:
             d = dbg[i]
             vals = [gp.x, gp.y, d["estpx"], d["estpy"], d["dx"], d["dy"],
                     d["obsvx"], d["obsvy"], d["x0vx"], d["x0vy"],
-                    d["tgt1x"], d["tgt1y"], d["seed"], d["cmd"]]
+                    d["tgt1x"], d["tgt1y"], d["seed"], d["cmd"], d["ksend"]]
             row += ["%.5f" % v for v in vals]
         self._csv.write(",".join(row) + "\n")
         self._csv.flush()

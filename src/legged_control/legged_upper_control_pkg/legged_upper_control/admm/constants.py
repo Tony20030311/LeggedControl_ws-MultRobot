@@ -85,6 +85,15 @@ RHO = 20.0          # ADMM penalty rho (fixed; spec: no wait-for-convergence / n
 SLACK_LAMBDA = 5.0  # edge slack penalty: phi(s) = SLACK_LAMBDA * s^2 (paper Eq.13)
 D_MIN = 0.6         # inter-agent minimum center separation [m] (edge CBF: ||p^i-p^j||^2 - D_MIN^2)
 P_ITERS = 20        # ADMM iterations per control cycle (fixed 15-20, no convergence stop)
+# How many of the N horizon steps to hand OCS2 as x_ref (motion_adapter truncation).
+# OCS2's mpc.timeHorizon = 1.0s = 10 steps @ Ts=0.1, so only the first ~10 steps are
+# ever tracked; past the sent trajectory OCS2 zero-order-hold CLAMPS to the last (safe)
+# point. Only k=0 is a HARD CBF step (node-edge splitting caps active hard steps ~2,
+# see verify_edge_handoff.py), so the far tail of xi drifts unsafe -- but it is safe
+# through ~k=10 (soft CBF + receding-horizon re-solve). Truncating to K_SEND drops the
+# unsafe tail AND makes OCS2 clamp-to-safe instead of interpolating into it. K_SEND<=10
+# (<= OCS2 horizon) so the clamp lands on a safe point; lower = thicker margin.
+K_SEND = 10
 
 
 # --- decision-vector index formulas (文件二 全局設定; 0-based) ------------------

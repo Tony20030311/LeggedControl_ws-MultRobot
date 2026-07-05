@@ -29,18 +29,25 @@ import constants as C  # noqa: E402
 
 
 class EdgeSubproblem:
-    def __init__(self, n=None, rho=None, slack_lambda=None, hard_k0=True):
+    def __init__(self, n=None, rho=None, slack_lambda=None, hard_through=1):
         self.N = C.N if n is None else int(n)
         N = self.N
         self.rho = C.RHO if rho is None else float(rho)
         self.slack_lambda = C.SLACK_LAMBDA if slack_lambda is None else float(slack_lambda)
-        # Hard edge k=0 (stage-1-consistent: node & edge both k=0 hard / k>=1 soft).
-        # All-soft cannot produce realized avoidance -- the g=3Ts^2*e gradient is too
-        # weak, so slack absorbs the violation until lambda_slk ~ 1e6, which then
-        # breaks ADMM convergence. Clamping the k=0 slack to 0 forces the immediate
-        # inter-agent avoidance while k>=1 stay soft (never infeasible; convergence
-        # kept). z is unbounded so the hard k=0 edge QP is always feasible.
-        self.hard_k0 = bool(hard_k0)
+        # hard_through K: clamp the k=0..K-1 edge-CBF slacks to 0 -> those steps are
+        # HARD (psi<=0, the paper's eq.13/16/18 form); k>=K stay soft (slack free,
+        # penalty lambda*s^2, the blueprint's <= b+s softening).
+        #   K=0    -> all soft: the weak 3Ts^2*e gradient lets slack absorb the
+        #             violation (no realized avoidance) unless lambda ~ 1e6, which
+        #             breaks convergence -- do not use for realized safety.
+        #   K=1    -> only k=0 hard (stage-1/2 default: immediate avoidance).
+        #   K=N-1  -> paper full-hard (whole horizon psi<=0).
+        # The edge QP stays feasible for ANY K: z is unbounded and each CBF row k
+        # touches only its own a^i_k,a^j_k (rows decoupled across k), so every
+        # "<= u_k" is satisfiable independently. The cost of large K is ADMM
+        # convergence (edge demands big a, the node's a_max can't match -> r_prim
+        # floor), NOT infeasibility. See verify_edge_handoff.py.
+        self.hard_through = max(0, int(hard_through))
 
         self.n_z = C.xi_dim(N)                 # 6N per copy
         self.n_cbf = N - 1                     # CBF accel-steps k = 0..N-2
@@ -79,8 +86,8 @@ class EdgeSubproblem:
         up_base = np.full(self.nrow, np.inf)     # slack rows: 0 <= s <= +inf
         for k in range(self.n_cbf):
             lo[self._r_snn + k] = 0.0
-        if self.hard_k0:                         # clamp k=0 slack to 0 -> hard k=0 row
-            up_base[self._r_snn + 0] = 0.0
+        for k in range(min(self.hard_through, self.n_cbf)):   # s_k=0 -> hard rows k=0..K-1
+            up_base[self._r_snn + k] = 0.0
         self._lo = lo
         self._up_base = up_base
 

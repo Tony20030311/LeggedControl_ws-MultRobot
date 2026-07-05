@@ -349,10 +349,12 @@ class OCS2TargetPublisher:
     def _to_msg(self, times, states):
         # OCS2 target contract (getDesiredState = linear interp + boundary CLAMP):
         #  - time/state/input EQUAL length; - times ABSOLUTE (first > obs.time);
-        #  - span >= mpc.timeHorizon (1.0s; ours N*ts = 2.0s so the whole horizon is
-        #    covered, no clamp-to-endpoint contradiction). The legged cost ignores the
-        #    target input (uNominal = weightCompensatingInput) but we send equal-length
-        #    zeros to honour the contract instead of an empty array.
+        #  - span = K_SEND*Ts = 1.0s = mpc.timeHorizon: we truncate to OCS2's horizon
+        #    ON PURPOSE so past it OCS2 clamps to the last (safe) sent point rather than
+        #    tracking the unsafe far tail of xi (see motion_adapter.build_target /
+        #    C.K_SEND). The legged cost ignores the target input (uNominal =
+        #    weightCompensatingInput) but we send equal-length zeros to honour the
+        #    contract instead of an empty array.
         assert len(times) == len(states), "target time/state length mismatch"
         m = mpc_target_trajectories()
         m.timeTrajectory = times

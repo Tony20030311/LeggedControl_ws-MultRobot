@@ -42,9 +42,12 @@ def consensus_target(z, lam, i, neighbors):
 
 class ADMMCoordinator:
     def __init__(self, p_iters=None, rho=None, dogs=(1, 2), edges=((1, 2),),
-                 formation=None, w_form=0.0, obstacles=None, walls=None):
+                 formation=None, w_form=0.0, obstacles=None, walls=None,
+                 hard_through=1):
         self.rho = C.RHO if rho is None else float(rho)
         self.P = C.P_ITERS if p_iters is None else int(p_iters)
+        # edge-CBF hard span: k=0..hard_through-1 hard, rest soft (see EdgeSubproblem).
+        self.hard_through = int(hard_through)
         self.dogs = list(dogs)
         self.edges = [tuple(e) for e in edges]
         # DI: LaplacianFormation (or None) injected by the verify script so the
@@ -63,7 +66,8 @@ class ADMMCoordinator:
                                           n_neighbors=len(self.neighbors[i]),
                                           w_form=self.w_form)
                      for i in self.dogs}
-        self.edge = {e: es.EdgeSubproblem(rho=self.rho) for e in self.edges}
+        self.edge = {e: es.EdgeSubproblem(rho=self.rho, hard_through=self.hard_through)
+                     for e in self.edges}
         self.N = self.node[self.dogs[0]].N
         self.nz = C.xi_dim(self.N)
         self.cycle = 0
@@ -137,6 +141,7 @@ class ADMMCoordinator:
         # 3. ADMM loop (fixed P_ITERS, no wait-for-convergence)
         xi = {i: xibar[i].copy() for i in self.dogs}
         hist = {"r_prim": [], "r_dual": [], "h2_viol": []}
+        edge_fail = 0
         z_prev = {e: {k: z[e][k].copy() for k in e} for e in self.edges}
         for _p in range(self.P):
             # node update (parallel over dogs)
@@ -150,8 +155,11 @@ class ADMMCoordinator:
             for (a, b) in self.edges:
                 zi, zj, _s = self.edge[(a, b)].solve(xi[a], xi[b],
                                                      lam[(a, b)][a], lam[(a, b)][b])
-                z[(a, b)][a] = zi
-                z[(a, b)][b] = zj
+                if zi is None:                 # edge QP failed (e.g. hard-span dual
+                    edge_fail += 1             # wind-up -> primal infeasible): keep the
+                else:                          # last z for this edge, flag it (never
+                    z[(a, b)][a] = zi          # run silently on a dead solve).
+                    z[(a, b)][b] = zj
             # dual update (scaled, NO rho factor)
             for (a, b) in self.edges:
                 lam[(a, b)][a] = lam[(a, b)][a] + (xi[a] - z[(a, b)][a])
@@ -163,6 +171,8 @@ class ADMMCoordinator:
             hist["r_dual"].append(self.rho * np.sqrt(rd2))
             hist["h2_viol"].append(self._h2_viol(xi, xnow))
             z_prev = {e: {k: z[e][k].copy() for k in e} for e in self.edges}
+
+        hist["edge_fail"] = edge_fail            # # of dead edge solves this cycle (0=clean)
 
         # 4. store for next-cycle warm start
         self.prev_xi = xi

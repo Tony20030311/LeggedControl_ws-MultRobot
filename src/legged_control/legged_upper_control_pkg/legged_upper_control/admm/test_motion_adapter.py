@@ -151,14 +151,18 @@ def test_build_target_default_is_path():
 
 # ---- full assembly from a real ξ ---------------------------------------------
 def test_build_target_shapes_times_inputs():
-    N = C.N
+    # build_target truncates to K_SEND steps (only OCS2's ~1s horizon is handed over).
+    K = C.K_SEND
     adap = ma.MotionAdapter(com_height=0.42, default_joints=DEFJ, input_dim=24)
     out = adap.build_target(_straight_xi(), t0=1.0, seed_yaw=0.0)
-    assert out["times"].shape == (N,)
+    assert out["times"].shape == (K,)
     assert np.all(np.diff(out["times"]) > 0)
     assert abs(out["times"][0] - (1.0 + C.TS)) < 1e-9
-    assert out["states"].shape == (N, ma.OCS2_STATE_DIM)
-    assert out["inputs"].shape == (N, 24) and np.all(out["inputs"] == 0.0)
+    assert abs(out["times"][-1] - (1.0 + K * C.TS)) < 1e-9
+    assert out["states"].shape == (K, ma.OCS2_STATE_DIM)
+    assert out["inputs"].shape == (K, 24) and np.all(out["inputs"] == 0.0)
+    # explicit k_send override wins
+    assert adap.build_target(_straight_xi(), k_send=3)["times"].shape == (3,)
 
 
 def test_build_target_places_admm_state():
@@ -166,10 +170,37 @@ def test_build_target_places_admm_state():
     xi = _straight_xi()
     adap = ma.MotionAdapter(com_height=0.42, default_joints=DEFJ)
     out = adap.build_target(xi, t0=0.0, seed_yaw=0.0)
-    for j in range(N):
+    for j in range(C.K_SEND):                                  # only the sent steps
         k = j + 1
         assert out["states"][j, 6] == xi[C.px_index(k, N)]     # px -> idx6
         assert out["states"][j, 7] == xi[C.py_index(k, N)]     # py -> idx7
         assert out["states"][j, 0] == xi[C.vx_index(k, N)]     # vx -> idx0
         assert out["states"][j, 8] == 0.42                      # z forced
         assert out["states"][j, 3] == 0.0                       # angular mom stays 0
+
+
+# ---- dynamic safe-prefix truncation (the node-edge handoff fix) ---------------
+def test_safe_prefix_truncates_at_first_violation():
+    # dog i marches +x (0.1,0.2,...); dog j sits at x=1.0. gap = |1.0 - 0.1(m+1)|.
+    # m=0..2 gap .9/.8/.7 clear; m=3 gap .6 (not < .6, clear); m=4 gap .5 (<.6) -> K=4.
+    px_i = np.array([0.1 * (m + 1) for m in range(C.N)]); py_i = np.zeros(C.N)
+    px_j = np.full(C.N, 1.0); py_j = np.zeros(C.N)
+    K = ma.safe_prefix_length(px_i, py_i, [(px_j, py_j)], d_safe=0.6, k_max=C.N)
+    assert K == 4, K
+    assert all(abs(1.0 - 0.1 * (m + 1)) >= 0.6 for m in range(K))       # every sent step clear
+    assert abs(1.0 - 0.1 * (K + 1)) < 0.6                                # the next one violates
+
+
+def test_safe_prefix_never_zero_and_caps_at_kmax():
+    px = np.zeros(C.N); py = np.zeros(C.N)
+    assert ma.safe_prefix_length(px, py, [(px, py)], 0.6, C.N) == 1      # overlap -> still >= 1
+    far = np.full(C.N, 10.0)
+    assert ma.safe_prefix_length(px, py, [(far, py)], 0.6, C.K_SEND) == C.K_SEND  # all clear -> cap
+
+
+def test_safe_prefix_checks_all_others():
+    px_i = np.array([0.1 * (m + 1) for m in range(C.N)]); py_i = np.zeros(C.N)
+    far = np.full(C.N, 10.0); near = np.full(C.N, 0.5)
+    K_far = ma.safe_prefix_length(px_i, py_i, [(far, py_i)], 0.6, C.N)
+    K_both = ma.safe_prefix_length(px_i, py_i, [(far, py_i), (near, py_i)], 0.6, C.N)
+    assert K_both < K_far                                                # nearest neighbour wins

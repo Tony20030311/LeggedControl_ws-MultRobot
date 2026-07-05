@@ -135,19 +135,51 @@ def yaw_trajectory_path(px_arr, py_arr, seed_yaw, lookahead_M, pos_eps, ema_alph
     return yaws
 
 
+def safe_prefix_length(px_i, py_i, others_pos, d_safe, k_max):
+    """Number of leading horizon steps (1..k_max) of dog i's predicted path that stay
+    >= d_safe from EVERY other dog's predicted path at the SAME step.
+
+    Truncating the OCS2 target to this prefix makes every sent x_ref point collision-
+    safe by construction; past it OCS2 zero-order-hold CLAMPS to the last (safe) sent
+    point (so the dog decelerates toward it rather than tracking the unsafe tail). This
+    is the fix for the node-edge handoff hole: only k=0 is a HARD CBF step (a_max caps
+    active hard steps ~2), so the ADMM plan itself dives unsafe at a close approach --
+    we hand OCS2 only the part of the plan we can vouch for.
+
+    px_i,py_i and each (px_j,py_j) in others_pos are step-aligned arrays (index m =
+    horizon step m+1). Returns >= 1: the first step is ~current and kept safe by the
+    k=0 hard CBF, so we always send at least it (never an empty target)."""
+    K = 0
+    kmax = min(int(k_max), len(px_i))
+    for m in range(kmax):
+        clear = True
+        for (px_j, py_j) in others_pos:
+            if math.hypot(px_i[m] - px_j[m], py_i[m] - py_j[m]) < d_safe:
+                clear = False
+                break
+        if not clear:
+            break
+        K = m + 1
+    return max(1, K)
+
+
 class MotionAdapter:
     """Holds the padding config + per-dog yaw seed; turns one ADMM ξ into an OCS2
     target trajectory (times, states, zero inputs)."""
 
     def __init__(self, com_height, default_joints, n=None, ts=None,
                  v_freeze=0.05, ema_alpha=0.3, input_dim=24,
-                 yaw_mode="path", lookahead_M=5, pos_eps=0.02):
+                 yaw_mode="path", lookahead_M=5, pos_eps=0.02, k_send=None):
         self.com_height = float(com_height)
         self.default_joints = np.asarray(default_joints, dtype=float)
         assert self.default_joints.shape == (N_JOINTS,), \
             f"default_joints must be {N_JOINTS}-vector"
         self.N = C.N if n is None else int(n)
         self.ts = C.TS if ts is None else float(ts)
+        # send only the first k_send horizon steps to OCS2 (<= its 1.0s = 10-step
+        # horizon); the far tail of xi is only soft-safe and drifts unsafe past ~k=10,
+        # so we drop it and let OCS2 clamp to the last (safe) sent point. See C.K_SEND.
+        self.k_send = C.K_SEND if k_send is None else int(k_send)
         self.v_freeze = float(v_freeze)
         self.ema_alpha = float(ema_alpha)
         self.input_dim = int(input_dim)
@@ -160,11 +192,15 @@ class MotionAdapter:
         self.pos_eps = float(pos_eps)
         self._seed = {}                       # per-dog yaw seed (cross-cycle)
 
-    def build_target(self, xi, t0=0.0, seed_yaw=0.0, yaw_mode=None):
-        """ξ (6N) -> dict(times(N,), states(N,24), inputs(N,input_dim), next_seed).
-        State x_k (k=1..N) is sent at time t0 + k*Ts; accelerations are dropped.
+    def build_target(self, xi, t0=0.0, seed_yaw=0.0, yaw_mode=None, k_send=None):
+        """ξ (6N) -> dict(times(ns,), states(ns,24), inputs(ns,input_dim), next_seed),
+        ns = k_send (default self.k_send). State x_k (k=1..ns) is sent at time
+        t0 + k*Ts; accelerations are dropped. yaw is computed over the FULL horizon
+        (its lookahead needs the real future) then truncated to the sent steps.
         yaw_mode overrides self.yaw_mode for this call ('path' | 'tangent')."""
         N = self.N
+        ns = self.k_send if k_send is None else int(k_send)
+        ns = max(1, min(ns, N))               # clamp to [1, N]
         xi = np.asarray(xi, dtype=float)
         px = np.array([xi[C.px_index(k, N)] for k in range(1, N + 1)])
         py = np.array([xi[C.py_index(k, N)] for k in range(1, N + 1)])
@@ -177,16 +213,16 @@ class MotionAdapter:
             yaws = yaw_trajectory_path(px, py, seed_yaw, self.lookahead_M,
                                        self.pos_eps, self.ema_alpha)
 
-        times = np.zeros(N)
-        states = np.zeros((N, OCS2_STATE_DIM))
-        for j in range(N):
+        times = np.zeros(ns)                  # send only the first ns (<=N) steps
+        states = np.zeros((ns, OCS2_STATE_DIM))
+        for j in range(ns):
             k = j + 1
             times[j] = t0 + k * self.ts
             states[j] = pad_ocs2_state(px[j], py[j], vx[j], vy[j], yaws[j],
                                        self.com_height, self.default_joints)
-        inputs = np.zeros((N, self.input_dim))    # zero control (OCS2 recomputes GRF)
+        inputs = np.zeros((ns, self.input_dim))   # zero control (OCS2 recomputes GRF)
         return dict(times=times, states=states, inputs=inputs,
-                    next_seed=float(yaws[-1]))
+                    next_seed=float(yaws[ns - 1]))
 
     def adapt(self, xi, dog, t0=0.0):
         """Stateful per-dog wrapper: uses/updates this dog's yaw seed across cycles."""

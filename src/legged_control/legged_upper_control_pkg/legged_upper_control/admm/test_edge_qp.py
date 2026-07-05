@@ -90,7 +90,7 @@ def test_edge_k0_is_hard():
     removes the slack escape, it does not touch the row coefficients."""
     N = C.N
     fr = _frozen_varying(N)
-    edge = es.EdgeSubproblem()                        # hard_k0 defaults True
+    edge = es.EdgeSubproblem()                        # hard_through defaults 1
     edge.set_linearization(fr)
     assert edge._u[edge._r_snn + 0] == 0.0            # k=0 slack clamped to 0 (hard)
     assert np.isinf(edge._u[edge._r_snn + 1])         # k=1 slack free (soft)
@@ -105,11 +105,26 @@ def test_edge_k0_is_hard():
     assert abs(g0[1] - 0.0046) < 1e-12                # h_{k+1} term still in the hard row
 
 
-def test_edge_soft_k0_option():
-    """hard_k0=False restores the all-soft edge (k=0 slack free) -- keep it explicit."""
-    edge = es.EdgeSubproblem(hard_k0=False)
+def test_edge_soft_option():
+    """hard_through=0 restores the all-soft edge (k=0 slack free) -- keep it explicit."""
+    edge = es.EdgeSubproblem(hard_through=0)
     edge.set_linearization(_frozen_varying())
     assert np.isinf(edge._u[edge._r_snn + 0])
+
+
+def test_edge_full_hard():
+    """hard_through=N-1 = paper full-hard: EVERY CBF-step slack clamped to 0, so every
+    k=0..N-2 row is hard (psi<=0 whole horizon). No slack escape anywhere."""
+    N = C.N
+    edge = es.EdgeSubproblem(hard_through=N - 1)
+    edge.set_linearization(_frozen_varying(N))
+    for k in range(edge.n_cbf):
+        assert edge._u[edge._r_snn + k] == 0.0        # all slacks clamped -> all hard
+    # window: hard_through=K clamps exactly k<K, leaves k>=K soft
+    win = es.EdgeSubproblem(hard_through=5)
+    win.set_linearization(_frozen_varying(N))
+    assert win._u[win._r_snn + 4] == 0.0              # k=4 hard (< 5)
+    assert np.isinf(win._u[win._r_snn + 5])           # k=5 soft (>= 5)
 
 
 def test_edge_solve_respects_cbf_and_slack():

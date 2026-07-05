@@ -250,3 +250,25 @@ kp_yaw, **goal_yaw_freeze_dist/goal_yaw_ema_alpha**(yaw 旁路搬 per-dog),
 - 轉角是否需 Bézier(先不加,抖再加)
 - h2_viol 幅度(決定是否需要兜底)
 - 精確 Bd 係數 3Ts² 在真機的表現
+
+## G. edge CBF handoff 安全(已驗,2026-07)
+
+**背景**:整條 2s ξ 當 OCS2 x_ref(軟成本、無 inter-agent CBF、無 staleness guard),對衝時 OCS2
+會追軟約束違反的未來步 → 撞。
+
+**關鍵發現(verify_edge_handoff.py + 7 次 Gazebo 實測)**:
+- **不能全硬(推翻「回到 paper 全硬」)**。node-edge 拆分下,硬 inter-agent CBF **只撐 ~2 個 active
+  binding 步**;硬約束遠端步要的相對加速度 `~u_k/g_k` 隨 `g_k=0.03·e→0`(逼近預測交會)爆掉,超過
+  `a_max=1.0`(A1 物理),node 追不上 z → dual 捲 → edge QP primal infeasible → plant 撞。已排除
+  C++/Python、a_max(×50)、bounds/迭代(×20/×5)——是 active 步數,非宣告步數。論文 50 全硬能跑,只因
+  其場景 active 步 ~1-2。**所以藍圖的「k=0 硬 / k≥1 軟」是對的,不是要修回硬。**
+- **修法 = 動態安全前綴截斷**(不是全硬、不是固定截斷)。每 cycle 只送「還 ≥ D_MIN(+`send_margin`)
+  的前幾步」給 OCS2(`motion_adapter.safe_prefix_length` → `build_target(k_send=)`,fleet publisher 用三狗
+  ξ 算),其餘 OCS2 zero-order-hold clamp 到最後安全點 → 狗放慢蠕行過。固定截斷 K_SEND=10 只把 ref 從
+  −0.40 改到 −0.30(仍破);動態截斷 → sent ref 恆 ≥ D_MIN(離線 +0.001),最壞前綴縮到 4 步。
+- **Gazebo 驗**:2/3/6.7m 對衝、180° 轉彎折返、三狗同時交叉(3 edge active)、V 編隊全過,交叉 min
+  pairwise 一致落 0.58–0.60(D_MIN 0.6,離散 CBF 固有 ~1-2cm 餘裕,物理接觸 0.35→安全),無撞無死鎖。
+  OCS2 追速度準(實際≈指令)、巡航 0.3;「慢」是交叉蠕行(設計)+ 到 goal 待命的平均假象,非缺陷。
+- `send_margin`(δ)是「reference 安全」旋鈕,**不改 realized 餘裕**(realized 由 CBF D_MIN 決定);δ=0.1
+  只把 min 0.591→0.599、卻更慢 → **保持 δ=0**。要嚴格 realized ≥ 0.6 得抬 D_MIN,但會撞 0.7 編隊 offset。
+- **未解**:密集場景(梅花樁,多 edge 同時 active)會壓到 2-active 上限,需靠參考規劃壓低 active edge 數。

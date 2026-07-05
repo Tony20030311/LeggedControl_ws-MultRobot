@@ -91,3 +91,7 @@ def test_admm_edge_constants():
     assert C.P_ITERS == 20                    # fixed ADMM iters (no wait-for-convergence)
     # all strictly positive -> consensus penalty PSD, edge slack penalty PSD, d^2>0
     assert C.RHO > 0 and C.SLACK_LAMBDA > 0 and C.D_MIN > 0 and C.P_ITERS > 0
+    # OCS2 target truncation: send only the near horizon (<= OCS2's 1.0s = 10 steps) so
+    # the tail clamps to a safe point instead of interpolating into the unsafe tail.
+    assert 1 <= C.K_SEND <= C.N                # a valid sub-horizon
+    assert C.K_SEND * C.TS <= 1.0 + 1e-9       # within OCS2's 1.0s mpc.timeHorizon
