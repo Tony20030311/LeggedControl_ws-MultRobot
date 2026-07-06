@@ -1,0 +1,72 @@
+<?xml version="1.0" ?>
+<sdf version="1.5">
+    <world name="default">
+        <physics type="ode">
+            <type>world</type>
+            <max_step_size>0.002</max_step_size>
+            <real_time_update_rate>500</real_time_update_rate>
+            <iters>500</iters>
+        </physics>
+
+        <include>
+            <uri>model://sun</uri>
+        </include>
+        <include>
+            <uri>model://ground_plane</uri>
+        </include>
+
+        <scene>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <background>0.9 0.9 0.9 1</background>
+            <shadows>false</shadows>
+        </scene>
+
+        <!-- ============================================================
+             基本障礙 arena (ADMM rung 2, node 圓障礙 CBF 上 Gazebo)
+             開放場 + 圓柱(node CBF 原生支援);無門/無牆 -> 避開 stage-3
+             窄縫隊形死鎖(那需 A*/彎參考,rung 2 尚未接)。
+             狗 V spawn dog1(2,0) dog2(1,1) dog3(1,-1),走向 x~6-7 的 V goals。
+             柱都放 +y 側,偏離每狗直線 -> 編隊整體從下方(-y)側向繞過,
+             不製造正對死鎖。座標必須對齊 ocs2_fleet_publisher.py 的
+             ARENAS["obstacles"](CBF 幾何);此處為起始值,Gazebo 實跑微調。
+             物理半徑 0.20 (CBF radius 0.30 -> r_eff = 0.30+0.30 = 0.60m 狗心淨距)。
+             ============================================================ -->
+
+        <!-- cyl_a: (4.0, 0.40) -->
+        <model name="cyl_a">
+            <static>true</static>
+            <pose>4.0 0.40 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <!-- cyl_b: (5.5, 0.40) -->
+        <model name="cyl_b">
+            <static>true</static>
+            <pose>5.5 0.40 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+    </world>
+</sdf>

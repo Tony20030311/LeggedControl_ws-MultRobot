@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  three_dogs_obstacles.launch (rung 2 — 基本障礙 arena)
+  =====================================================
+  three_dogs_empty.launch 的障礙版:載 three_dogs_obstacles.world(開放場 + 圓柱),
+  給 ADMM 三狗編隊 node 圓障礙 CBF 上 Gazebo 驗證用。
+  gui 預設 false = headless。spawn 位置沿用 five_dogs.launch 的 V 佈局。
+  控制器另外用 fleet_bringup.launch 載;站立/trot 用 start_fleet.sh;之後跑
+  scripts/ocs2_fleet_publisher.py _arena:=obstacles(障礙座標對齊 world 的 cylinder)。
+-->
+<launch>
+    <arg name="robot_type" default="a1"/>
+    <arg name="gui"        default="false"/>
+
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name"   value="$(find legged_gazebo)/worlds/three_dogs_obstacles.world"/>
+        <arg name="paused"       value="false"/>
+        <arg name="use_sim_time" value="true"/>
+        <arg name="gui"          value="$(arg gui)"/>
+    </include>
+
+    <!-- V spawn(同 five_dogs.launch):dog1 領前,dog2/3 左右後 -->
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"     value="dog1"/>
+        <arg name="init_x" value="2.0"/>
+        <arg name="init_y" value="0.0"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"     value="dog2"/>
+        <arg name="init_x" value="1.0"/>
+        <arg name="init_y" value="1.0"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"     value="dog3"/>
+        <arg name="init_x" value="1.0"/>
+        <arg name="init_y" value="-1.0"/>
+    </include>
+</launch>

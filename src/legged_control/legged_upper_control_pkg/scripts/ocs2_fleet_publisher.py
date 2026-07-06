@@ -55,6 +55,19 @@ FORMATIONS = {
 # default per-dog V slot goals (stage-3 V scenario).
 DEFAULT_GOALS = {1: (3.0, 0.0), 2: (2.3, 0.5), 3: (2.3, -0.5)}
 
+# obstacle arenas (rung 2 basic arena): circular obstacles fed to the node CBF plus
+# matching per-dog goals. Each obstacle "pos" MUST match a cylinder in the Gazebo world
+# (legged_gazebo/worlds/three_dogs_obstacles.world). "radius" = physical + clearance
+# buffer; the node CBF adds robot_margin (0.30) -> r_eff. Select via ~arena (default ""
+# = empty world, backward-compatible with the empty-world rung-2 flow).
+ARENAS = {
+    "obstacles": {
+        "obstacles": [{"pos": (4.0, 0.40), "radius": 0.30},
+                      {"pos": (5.5, 0.40), "radius": 0.30}],
+        "goals": {1: (7.0, 0.0), 2: (6.3, 0.5), 3: (6.3, -0.5)},
+    },
+}
+
 
 class FleetPublisher:
     def __init__(self):
@@ -65,16 +78,23 @@ class FleetPublisher:
         self.com_height = float(rospy.get_param("~com_height", 0.30))
         self.formation_name = rospy.get_param("~formation", "V")
         self.w_form = float(rospy.get_param("~w_form", 10.0))
-        # per-dog world-frame V slot goals (override via ~goalN_x / ~goalN_y).
-        self.goal = {i: np.array([float(rospy.get_param("~goal%d_x" % i, DEFAULT_GOALS[i][0])),
-                                  float(rospy.get_param("~goal%d_y" % i, DEFAULT_GOALS[i][1]))])
+        # arena selection: "" = empty world (default, backward-compatible with the
+        # empty-world rung-2 flow); a key in ARENAS -> its circular obstacles feed the
+        # node CBF and its goals become the per-dog defaults.
+        self.arena_name = rospy.get_param("~arena", "")
+        arena = ARENAS.get(self.arena_name, {"obstacles": [], "goals": DEFAULT_GOALS})
+        arena_obstacles, arena_goals = arena["obstacles"], arena["goals"]
+        # per-dog world-frame goals (arena defaults; override via ~goalN_x / ~goalN_y).
+        self.goal = {i: np.array([float(rospy.get_param("~goal%d_x" % i, arena_goals[i][0])),
+                                  float(rospy.get_param("~goal%d_y" % i, arena_goals[i][1]))])
                      for i in self.dogs}
 
-        # ONE coupled coordinator: leaderless complete graph, empty world (no obs/walls).
+        # ONE coupled coordinator: leaderless complete graph. obstacles from the arena
+        # (node-local circular CBF); no walls in the open-field basic arena.
         lf = LaplacianFormation(FORMATIONS)
         lf.set_formation(self.formation_name)
         self.coord = ac.ADMMCoordinator(dogs=tuple(self.dogs), edges=tuple(self.edges),
-                                        obstacles=[], walls=[],
+                                        obstacles=arena_obstacles, walls=[],
                                         formation=lf, w_form=self.w_form)
         # shared adapter (per-dog path yaw; seed re-anchored to each dog's MEASURED yaw
         # every cycle -> DON'T use adapter.adapt()'s internal seed, call build_target).
@@ -132,8 +152,10 @@ class FleetPublisher:
             self._csv = None
 
         rospy.Timer(rospy.Duration(self.ts), self._tick)
-        rospy.loginfo("[fleet_pub] dogs=%s formation=%s w_form=%.1f v=%.2f goals=%s",
-                      self.dogs, self.formation_name, self.w_form, self.v,
+        rospy.loginfo("[fleet_pub] dogs=%s formation=%s w_form=%.1f v=%.2f arena=%r "
+                      "obstacles=%s goals=%s", self.dogs, self.formation_name,
+                      self.w_form, self.v, self.arena_name or "(empty)",
+                      [o["pos"] for o in self.coord.obstacles],
                       {i: self.goal[i].tolist() for i in self.dogs})
 
     def _obs_cb(self, msg, i):
