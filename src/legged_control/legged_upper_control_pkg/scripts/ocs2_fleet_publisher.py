@@ -272,6 +272,17 @@ class FleetPublisher:
             rospy.logwarn_throttle(2.0, "[fleet_pub] coord.step failed: %s", e)
             return
 
+        # NaN guard (the door-arena fall root cause): OSQP returns a non-finite xi when the
+        # node/edge QP goes infeasible (e.g. a dog squeezed between an obstacle-CBF and the
+        # edge-CBF at a tight spot). A NaN is NOT an exception, so it slips past the try above
+        # and a NaN target crashes OCS2's SqpSolver -> the dog falls. Never publish it: hold
+        # the last good target this cycle (OCS2 zero-order-holds -> the dog decelerates toward
+        # the last safe point instead of toppling). Coordinator couples all 3, so hold all.
+        if not all(np.all(np.isfinite(np.asarray(xi[i], float))) for i in self.dogs):
+            rospy.logwarn_throttle(1.0, "[fleet_pub] ADMM xi non-finite (QP infeasible) "
+                                        "-> HOLD last targets this cycle")
+            return
+
         # world-frame predicted positions per dog (for inter-agent safe-prefix truncation)
         wpx = {i: np.array([xi[i][C.px_index(k, self.N)] for k in range(1, self.N + 1)])
                for i in self.dogs}
