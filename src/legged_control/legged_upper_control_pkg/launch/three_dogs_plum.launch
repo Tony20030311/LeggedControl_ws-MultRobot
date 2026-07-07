@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<!--
+  three_dogs_plum.launch (rung 2 — 梅花樁密集 arena demo)
+  ======================================================
+  three_dogs_obstacles.launch 的梅花樁版:載 three_dogs_plum.world(10 圓柱梅花樁陣),
+  給 ADMM 三狗編隊「穿樁」demo 用。直線 reference 會 deadlock -> 跑 publisher 要帶
+  _arena:=plum _use_astar:=true(per-dog A* 彎曲 reference)。控制器仍用 fleet_bringup.launch
+  載、start_fleet.sh 站/trot。gui 預設 false = headless。spawn 沿用 V 佈局。
+-->
+<launch>
+    <arg name="robot_type" default="a1"/>
+    <arg name="gui"        default="false"/>
+
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name"   value="$(find legged_gazebo)/worlds/three_dogs_plum.world"/>
+        <arg name="paused"       value="false"/>
+        <arg name="use_sim_time" value="true"/>
+        <arg name="gui"          value="$(arg gui)"/>
+    </include>
+
+    <!-- V spawn(同 five_dogs.launch):dog1 領前,dog2/3 左右後 -->
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"     value="dog1"/>
+        <arg name="init_x" value="2.0"/>
+        <arg name="init_y" value="0.0"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"     value="dog2"/>
+        <arg name="init_x" value="1.0"/>
+        <arg name="init_y" value="1.0"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns"     value="dog3"/>
+        <arg name="init_x" value="1.0"/>
+        <arg name="init_y" value="-1.0"/>
+    </include>
+</launch>

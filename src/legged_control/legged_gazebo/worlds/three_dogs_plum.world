@@ -1,0 +1,200 @@
+<?xml version="1.0" ?>
+<sdf version="1.5">
+    <world name="default">
+        <physics type="ode">
+            <type>world</type>
+            <max_step_size>0.002</max_step_size>
+            <real_time_update_rate>500</real_time_update_rate>
+            <iters>500</iters>
+        </physics>
+
+        <include><uri>model://sun</uri></include>
+        <include><uri>model://ground_plane</uri></include>
+
+        <scene>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <background>0.9 0.9 0.9 1</background>
+            <shadows>false</shadows>
+        </scene>
+
+        <!-- ============================================================
+             梅花樁 (plum-blossom / quincunx) arena — ADMM rung 2 dense demo.
+             10 圓柱(物理 r=0.20;CBF radius 0.30 -> r_eff=0.60 狗心淨距)排成
+             梅花樁陣。直線 reference 會 deadlock -> 此 arena 需 ~use_astar
+             (per-dog A* 彎曲 reference)。座標對齊 ocs2_fleet_publisher.py
+             ARENAS["plum"] 的 obstacles(CBF/A* 幾何單一真相源)。
+             狗 V spawn dog1(2,0) dog2(1,1) dog3(1,-1) -> V goals x~8-9。
+             ============================================================ -->
+
+        <model name="peg_00">
+            <static>true</static>
+            <pose>3.4 1.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_01">
+            <static>true</static>
+            <pose>3.4 -1.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_02">
+            <static>true</static>
+            <pose>4.7 0.0 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_03">
+            <static>true</static>
+            <pose>4.7 2.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_04">
+            <static>true</static>
+            <pose>4.7 -2.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_05">
+            <static>true</static>
+            <pose>6.0 1.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_06">
+            <static>true</static>
+            <pose>6.0 -1.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_07">
+            <static>true</static>
+            <pose>7.3 0.0 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_08">
+            <static>true</static>
+            <pose>7.3 2.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+        <model name="peg_09">
+            <static>true</static>
+            <pose>7.3 -2.1 0.25  0 0 0</pose>
+            <link name="link">
+                <collision name="col">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                </collision>
+                <visual name="vis">
+                    <geometry><cylinder><radius>0.2</radius><length>0.5</length></cylinder></geometry>
+                    <material>
+                        <ambient>0.5 0.5 0.5 1</ambient>
+                        <diffuse>0.5 0.5 0.5 1</diffuse>
+                    </material>
+                </visual>
+            </link>
+        </model>
+
+    </world>
+</sdf>

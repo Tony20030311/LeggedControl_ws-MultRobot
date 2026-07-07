@@ -41,6 +41,7 @@ import constants as C                  # noqa: E402
 import admm_coordinator as ac          # noqa: E402
 from reference import build_reference  # noqa: E402
 from core.formation import LaplacianFormation  # noqa: E402
+from core.planning import AStarPlanner  # noqa: E402  (dense-arena curved refs)
 
 # A1 standing pose (same placeholder as the single-dog publisher).
 A1_DEFAULT_JOINTS = [0.1, 0.8, -1.5, -0.1, 0.8, -1.5,
@@ -65,6 +66,18 @@ ARENAS = {
         "obstacles": [{"pos": (4.0, 0.40), "radius": 0.30},
                       {"pos": (5.5, 0.40), "radius": 0.30}],
         "goals": {1: (7.0, 0.0), 2: (6.3, 0.5), 3: (6.3, -0.5)},
+    },
+    # 梅花樁 (plum-blossom / quincunx): dense circular pegs the V formation threads.
+    # Straight refs DEADLOCK on any in-corridor peg -> this arena REQUIRES ~use_astar
+    # (per-dog A* curved refs). Pegs off the exact centre lines; r_eff = 0.30+0.30=0.60.
+    # Offline-validated: scratchpad/measure_plum.py threads all 3 clean, barriers>=0.
+    "plum": {
+        "obstacles": [{"pos": p, "radius": 0.30} for p in
+                      [(3.4, 1.1), (3.4, -1.1),
+                       (4.7, 0.0), (4.7, 2.1), (4.7, -2.1),
+                       (6.0, 1.1), (6.0, -1.1),
+                       (7.3, 0.0), (7.3, 2.1), (7.3, -2.1)]],
+        "goals": {1: (9.0, 0.0), 2: (8.3, 0.5), 3: (8.3, -0.5)},
     },
 }
 
@@ -120,6 +133,25 @@ class FleetPublisher:
         # only the part we can vouch for. send_cap caps it at OCS2's ~1s horizon.
         self.send_cap = int(rospy.get_param("~k_send", C.K_SEND))
         self.d_safe = C.D_MIN + float(rospy.get_param("~send_margin", 0.0))
+
+        # dense-arena curved references (~use_astar): straight per-dog refs DEADLOCK on
+        # any peg in the formation corridor (the reactive single-linearization CBF can't
+        # find the global detour). A* over the SAME obstacles gives each dog a curved
+        # waypoint polyline that build_reference already samples -> no ADMM-core change.
+        # Planned ONCE per dog on the first ready tick (static field); off by default so
+        # the open-field / basic-obstacle flows stay byte-identical. r_astar (0.35) +
+        # peg radius (0.30) = 0.65 keeps the reference centre >= node-CBF r_eff (0.60).
+        self.use_astar = bool(rospy.get_param("~use_astar", False))
+        self._path = {}                                  # per-dog A* polyline (lazy)
+        self._planner = None
+        if self.use_astar and self.coord.obstacles:
+            r_astar = float(rospy.get_param("~astar_robot_radius", 0.35))
+            self._planner = AStarPlanner(
+                resolution=float(rospy.get_param("~astar_res", 0.15)),
+                robot_radius=r_astar,
+                obstacles=[{"pos": o["pos"], "radius": o["radius"]}
+                           for o in self.coord.obstacles],
+                x_min=0.0, x_max=10.0, y_min=-4.0, y_max=4.0)
 
         self.obs = {i: None for i in self.dogs}
         self.gt = {i: None for i in self.dogs}
@@ -181,6 +213,18 @@ class FleetPublisher:
         vy0 = float(np.clip(self._v_ema[i][1], -C.MAX_VY, C.MAX_VY))
         return np.array([P0[0], P0[1], vx0, vy0]), P0
 
+    def _waypoints(self, i, P0i):
+        """Reference polyline for dog i: A* curved path (planned once, dense arenas)
+        or the straight [current, goal] segment. build_reference samples either."""
+        if self._planner is None:
+            return [P0i.tolist(), self.goal[i].tolist()]
+        if i not in self._path:                          # plan once from the real start
+            p = self._planner.plan(tuple(P0i), tuple(self.goal[i]))
+            self._path[i] = p if p else [P0i.tolist(), self.goal[i].tolist()]
+            rospy.loginfo("[fleet_pub] dog%d A* waypoints=%d%s", i, len(self._path[i]),
+                          " (EMPTY->straight fallback)" if not p else "")
+        return self._path[i]
+
     def _tick(self, _evt):
         if not self._ready():
             rospy.logwarn_throttle(2.0, "[fleet_pub] waiting for all 3 obs+gt ...")
@@ -188,7 +232,7 @@ class FleetPublisher:
         xnow, P0 = {}, {}
         for i in self.dogs:
             xnow[i], P0[i] = self._x0(i)
-        xdes = {i: build_reference(P0[i], [P0[i].tolist(), self.goal[i].tolist()],
+        xdes = {i: build_reference(P0[i], self._waypoints(i, P0[i]),
                                    v_cruise=self.v) for i in self.dogs}
         try:
             xi, _hist = self.coord.step(xnow, xdes)
