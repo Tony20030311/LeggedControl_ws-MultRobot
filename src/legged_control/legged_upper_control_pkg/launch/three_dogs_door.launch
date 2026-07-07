@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!--
+  three_dogs_door.launch (rung 2 — real target map: door + obstacles + walls)
+  ==========================================================================
+  3-dog version of five_dogs.launch: loads legged_gazebo/worlds/obstacle_world.world
+  (2.5m door at x=6 + 5 cylinders + boundary walls) with 3 dogs (not 5). For the ADMM
+  fleet: run publisher with _arena:=door _use_astar:=true (A* routes through the door;
+  node CBF = cylinders + door posts + boundary wall half-planes). gui default false.
+  Geometry aligned to ARENAS["door"] in ocs2_fleet_publisher.py.
+-->
+<launch>
+    <arg name="robot_type" default="a1"/>
+    <arg name="gui"        default="false"/>
+
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name"   value="$(find legged_gazebo)/worlds/obstacle_world.world"/>
+        <arg name="paused"       value="false"/>
+        <arg name="use_sim_time" value="true"/>
+        <arg name="gui"          value="$(arg gui)"/>
+    </include>
+
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns" value="dog1"/><arg name="init_x" value="2.0"/><arg name="init_y" value="0.0"/>
+    </include>
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns" value="dog2"/><arg name="init_x" value="1.0"/><arg name="init_y" value="1.0"/>
+    </include>
+    <include file="$(find legged_unitree_description)/launch/single_dog.launch">
+        <arg name="robot_type" value="$(arg robot_type)"/>
+        <arg name="ns" value="dog3"/><arg name="init_x" value="1.0"/><arg name="init_y" value="-1.0"/>
+    </include>
+</launch>

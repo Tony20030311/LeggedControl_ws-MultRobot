@@ -79,6 +79,31 @@ ARENAS = {
                        (7.3, 0.0), (7.3, 2.1), (7.3, -2.1)]],
         "goals": {1: (9.0, 0.0), 2: (8.3, 0.5), 3: (8.3, -0.5)},
     },
+    # door arena = the real target map (legged_gazebo/worlds/obstacle_world.world, the
+    # five_dogs.launch arena). A 2.5m DOOR at x=6 + 5 field cylinders + boundary walls.
+    # A half-plane can't make a gap (stage-3 lesson), so the door is: A* rect obstacles
+    # (full wall boxes -> routes through the gap) + circular door-POSTS at the corners
+    # (local node CBF). Boundary walls (right/top/bottom, no gap) are node-CBF half-planes.
+    # Requires ~use_astar. Offline-validated: scratchpad/measure_door.py threads all 3.
+    "door": {
+        "obstacles": ([{"pos": p, "radius": 0.30} for p in    # 5 field cylinders (r_eff 0.60)
+                       [(7.5, 2.5), (8.5, -1.5), (9.0, 3.5), (7.0, -3.0), (8.0, 0.5)]]
+                      + [{"pos": p, "radius": 0.15} for p in   # door posts (r_eff 0.45)
+                         [(6.0, 1.25), (6.0, 1.75), (6.0, -1.25), (6.0, -1.75)]]),
+        "walls": [   # boundary half-planes: normal points INTO free space
+            {"normal": (-1.0, 0.0), "point": (9.925, 0.0), "d_safe": 0.30},   # right x=10
+            {"normal": (0.0, -1.0), "point": (0.0, 4.925), "d_safe": 0.30},   # top y=5
+            {"normal": (0.0, 1.0), "point": (0.0, -4.925), "d_safe": 0.30},   # bottom y=-5
+        ],
+        "rects": [   # A* rect obstacles = the 5 physical wall boxes (center, size)
+            {"center": (6.0, 3.125), "size": (0.15, 3.75)},   # wall_left_upper
+            {"center": (6.0, -3.125), "size": (0.15, 3.75)},  # wall_left_lower
+            {"center": (10.0, 0.0), "size": (0.15, 10.0)},    # wall_right
+            {"center": (8.0, 5.0), "size": (4.0, 0.15)},      # wall_top
+            {"center": (8.0, -5.0), "size": (4.0, 0.15)},     # wall_bottom
+        ],
+        "goals": {1: (9.3, 0.5), 2: (8.6, 1.0), 3: (8.6, 0.0)},   # V slots clear of (8,0.5)
+    },
 }
 
 
@@ -97,6 +122,10 @@ class FleetPublisher:
         self.arena_name = rospy.get_param("~arena", "")
         arena = ARENAS.get(self.arena_name, {"obstacles": [], "goals": DEFAULT_GOALS})
         arena_obstacles, arena_goals = arena["obstacles"], arena["goals"]
+        # walls = node-CBF half-planes (boundaries); rects = A*-only box obstacles (walls
+        # the CBF can't represent as a gap, e.g. the door). Both optional (open arenas omit).
+        arena_walls = arena.get("walls", [])
+        self._arena_rects = arena.get("rects", [])
         # per-dog world-frame goals (arena defaults; override via ~goalN_x / ~goalN_y).
         self.goal = {i: np.array([float(rospy.get_param("~goal%d_x" % i, arena_goals[i][0])),
                                   float(rospy.get_param("~goal%d_y" % i, arena_goals[i][1]))])
@@ -107,7 +136,7 @@ class FleetPublisher:
         lf = LaplacianFormation(FORMATIONS)
         lf.set_formation(self.formation_name)
         self.coord = ac.ADMMCoordinator(dogs=tuple(self.dogs), edges=tuple(self.edges),
-                                        obstacles=arena_obstacles, walls=[],
+                                        obstacles=arena_obstacles, walls=arena_walls,
                                         formation=lf, w_form=self.w_form)
         # shared adapter (per-dog path yaw; seed re-anchored to each dog's MEASURED yaw
         # every cycle -> DON'T use adapter.adapt()'s internal seed, call build_target).
@@ -151,7 +180,8 @@ class FleetPublisher:
                 robot_radius=r_astar,
                 obstacles=[{"pos": o["pos"], "radius": o["radius"]}
                            for o in self.coord.obstacles],
-                x_min=0.0, x_max=10.0, y_min=-4.0, y_max=4.0)
+                x_min=0.0, x_max=10.0, y_min=-5.0, y_max=5.0,
+                rect_obstacles=self._arena_rects)   # A* respects wall boxes (door etc.)
 
         self.obs = {i: None for i in self.dogs}
         self.gt = {i: None for i in self.dogs}
@@ -219,10 +249,12 @@ class FleetPublisher:
         if self._planner is None:
             return [P0i.tolist(), self.goal[i].tolist()]
         if i not in self._path:                          # plan once from the real start
-            p = self._planner.plan(tuple(P0i), tuple(self.goal[i]))
+            # find_reachable_goal snaps an occupied/near-obstacle goal to the nearest free
+            # cell and returns the path (legacy-stack pattern; robust in cluttered fields).
+            cand, p = self._planner.find_reachable_goal(tuple(P0i), tuple(self.goal[i]))
             self._path[i] = p if p else [P0i.tolist(), self.goal[i].tolist()]
-            rospy.loginfo("[fleet_pub] dog%d A* waypoints=%d%s", i, len(self._path[i]),
-                          " (EMPTY->straight fallback)" if not p else "")
+            rospy.loginfo("[fleet_pub] dog%d A* waypoints=%d goal->%s%s", i, len(self._path[i]),
+                          cand, " (EMPTY->straight fallback)" if not p else "")
         return self._path[i]
 
     def _tick(self, _evt):
