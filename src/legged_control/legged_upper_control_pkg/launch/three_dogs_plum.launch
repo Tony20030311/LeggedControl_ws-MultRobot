@@ -5,11 +5,11 @@
   three_dogs_obstacles.launch 的梅花樁版:載 three_dogs_plum.world(10 圓柱梅花樁陣),
   給 ADMM 三狗編隊「穿樁」demo 用。直線 reference 會 deadlock -> 跑 publisher 要帶
   _arena:=plum _use_astar:=true(per-dog A* 彎曲 reference)。控制器仍用 fleet_bringup.launch
-  載、start_fleet.sh 站/trot。gui 預設 false = headless。spawn 沿用 V 佈局。
+  載、start_fleet.sh 站/trot。gui 預設 true(看畫面);headless 跑 gui:=false。spawn 沿用 V 佈局。
 -->
 <launch>
     <arg name="robot_type" default="a1"/>
-    <arg name="gui"        default="false"/>
+    <arg name="gui"        default="true"/>
 
     <include file="$(find gazebo_ros)/launch/empty_world.launch">
         <arg name="world_name"   value="$(find legged_gazebo)/worlds/three_dogs_plum.world"/>
