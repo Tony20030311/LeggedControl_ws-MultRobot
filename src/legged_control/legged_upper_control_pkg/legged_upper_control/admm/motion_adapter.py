@@ -104,7 +104,8 @@ def yaw_trajectory(vx_arr, vy_arr, seed_yaw, v_freeze, ema_alpha):
     return yaws
 
 
-def yaw_trajectory_path(px_arr, py_arr, seed_yaw, lookahead_M, pos_eps, ema_alpha):
+def yaw_trajectory_path(px_arr, py_arr, seed_yaw, lookahead_M, pos_eps, ema_alpha,
+                        max_dyaw=None):
     """Route B yaw: head along the PLANNED PATH (position lookahead), not the
     instantaneous velocity. yaw_k = atan2(p[k+M]-p[k]) over the SAME ξ positions.
 
@@ -130,7 +131,10 @@ def yaw_trajectory_path(px_arr, py_arr, seed_yaw, lookahead_M, pos_eps, ema_alph
             raw = prev                            # trajectory ~stopped -> hold heading
         else:
             raw = math.atan2(dy, dx)
-        prev = prev + ema_alpha * wrap_to_pi(raw - prev)   # continuous accumulate
+        step = ema_alpha * wrap_to_pi(raw - prev)          # shortest-arc increment
+        if max_dyaw is not None:                           # yaw slew-rate cap per step
+            step = max(-max_dyaw, min(max_dyaw, step))     # blocks the corner whipsaw/spin
+        prev = prev + step                                 # continuous accumulate
         yaws[k] = prev
     return yaws
 
@@ -169,7 +173,8 @@ class MotionAdapter:
 
     def __init__(self, com_height, default_joints, n=None, ts=None,
                  v_freeze=0.05, ema_alpha=0.3, input_dim=24,
-                 yaw_mode="path", lookahead_M=5, pos_eps=0.02, k_send=None):
+                 yaw_mode="path", lookahead_M=5, pos_eps=0.02, k_send=None,
+                 max_yaw_rate=None):
         self.com_height = float(com_height)
         self.default_joints = np.asarray(default_joints, dtype=float)
         assert self.default_joints.shape == (N_JOINTS,), \
@@ -190,6 +195,9 @@ class MotionAdapter:
         # Gazebo (exposed as ~lookahead_m / ~pos_eps params in the publisher).
         self.lookahead_M = int(lookahead_M)
         self.pos_eps = float(pos_eps)
+        # yaw slew-rate cap: max heading change per horizon step (rad). None = uncapped
+        # (legacy). Blocks the sharp-corner yaw whipsaw that spins/topples the trot.
+        self.max_dyaw = None if max_yaw_rate is None else float(max_yaw_rate) * self.ts
         self._seed = {}                       # per-dog yaw seed (cross-cycle)
 
     def build_target(self, xi, t0=0.0, seed_yaw=0.0, yaw_mode=None, k_send=None):
@@ -211,7 +219,7 @@ class MotionAdapter:
             yaws = yaw_trajectory(vx, vy, seed_yaw, self.v_freeze, self.ema_alpha)
         else:                                 # 'path' (Route B, default)
             yaws = yaw_trajectory_path(px, py, seed_yaw, self.lookahead_M,
-                                       self.pos_eps, self.ema_alpha)
+                                       self.pos_eps, self.ema_alpha, self.max_dyaw)
 
         times = np.zeros(ns)                  # send only the first ns (<=N) steps
         states = np.zeros((ns, OCS2_STATE_DIM))

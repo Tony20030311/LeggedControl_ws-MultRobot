@@ -29,6 +29,7 @@ import rospy
 from ocs2_msgs.msg import (mpc_target_trajectories, mpc_state, mpc_input,
                            mpc_observation)
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
 
 # rospy-free ADMM core (admm/) + core.formation (this node IS rospy, so it may import
 # core.formation and inject it -- keeping the coordinator itself rospy-free).
@@ -145,7 +146,8 @@ class FleetPublisher:
                                         n=self.N, ts=self.ts,
                                         yaw_mode="path", ema_alpha=0.2,
                                         lookahead_M=int(rospy.get_param("~lookahead_m", 5)),
-                                        pos_eps=float(rospy.get_param("~pos_eps", 0.02)))
+                                        pos_eps=float(rospy.get_param("~pos_eps", 0.02)),
+                                        max_yaw_rate=float(rospy.get_param("~yaw_rate_max", 1.2)))
 
         # goal-proximity yaw latch: near its slot a dog isn't really travelling, so the
         # path-lookahead direction is noise -> the measured-yaw-seeded feedback winds the
@@ -180,7 +182,10 @@ class FleetPublisher:
                 robot_radius=r_astar,
                 obstacles=[{"pos": o["pos"], "radius": o["radius"]}
                            for o in self.coord.obstacles],
-                x_min=0.0, x_max=10.0, y_min=-5.0, y_max=5.0,
+                x_min=float(rospy.get_param("~astar_x_min", 0.0)),
+                x_max=float(rospy.get_param("~astar_x_max", 10.0)),
+                y_min=float(rospy.get_param("~astar_y_min", -5.0)),
+                y_max=float(rospy.get_param("~astar_y_max", 5.0)),
                 rect_obstacles=self._arena_rects)   # A* respects wall boxes (door etc.)
 
         self.obs = {i: None for i in self.dogs}
@@ -197,6 +202,9 @@ class FleetPublisher:
                              self._obs_cb, callback_args=i)
             rospy.Subscriber("/%s/ground_truth/state" % ns, Odometry,
                              self._gt_cb, callback_args=i)
+            # live re-targeting (demo tours): publish PoseStamped to /dogN/goal to send the
+            # fleet to a new waypoint mid-run; forces an A* re-plan from the current pose.
+            rospy.Subscriber("/%s/goal" % ns, PoseStamped, self._goal_cb, callback_args=i)
 
         # combined per-tick log (host reads via the mount) -- per-dog gt + commanded yaw.
         self._csv_path = rospy.get_param("~log_csv", os.path.join(
@@ -225,6 +233,16 @@ class FleetPublisher:
 
     def _gt_cb(self, msg, i):
         self.gt[i] = msg
+
+    def _goal_cb(self, msg, i):
+        """Live re-target dog i (demo tours): update the goal + drop the cached A* path so
+        _waypoints re-plans from the current pose next tick; clear the yaw latch to steer."""
+        self.goal[i] = np.array([msg.pose.position.x, msg.pose.position.y])
+        self._path.pop(i, None)
+        if hasattr(self, "_yaw_latch"):
+            self._yaw_latch[i] = None
+        rospy.loginfo("[fleet_pub] dog%d new goal (%.2f,%.2f)",
+                      i, self.goal[i][0], self.goal[i][1])
 
     def _ready(self):
         return all(self.obs[i] is not None and self.obs[i].time != 0.0

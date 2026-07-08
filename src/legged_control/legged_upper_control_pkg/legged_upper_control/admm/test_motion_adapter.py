@@ -113,6 +113,23 @@ def test_path_yaw_ignores_velocity_sway():
     assert np.ptp(tangent) > 0.5                        # tangent yaw chases the sway
 
 
+def test_path_yaw_slew_rate_cap():
+    """Sharp corner (path turns ~135deg mid-horizon). Without a cap the yaw whipsaws
+    (a big single-step jump -> trot spins -> topples). With max_dyaw the per-step yaw
+    change is bounded to the cap -- the fix for the plum round-trip return topple."""
+    n = 20
+    # L-shaped path: go +x for 10 steps, then +y (a hard left turn) for 10.
+    px = np.array([0.1 * (k + 1) if k < 10 else 1.0 for k in range(n)])
+    py = np.array([0.0 if k < 10 else 0.1 * (k - 9) for k in range(n)])
+    uncapped = ma.yaw_trajectory_path(px, py, 0.0, lookahead_M=5, pos_eps=0.02,
+                                      ema_alpha=0.5, max_dyaw=None)
+    capped = ma.yaw_trajectory_path(px, py, 0.0, lookahead_M=5, pos_eps=0.02,
+                                    ema_alpha=0.5, max_dyaw=0.1)
+    assert np.max(np.abs(np.diff(uncapped))) > 0.15    # corner causes a big yaw step
+    assert np.all(np.abs(np.diff(capped)) <= 0.1 + 1e-9)  # every step within the cap
+    assert abs(capped[0]) <= 0.1 + 1e-9                 # first (sent) step also bounded
+
+
 def test_path_yaw_points_at_goal_and_freezes():
     """Decelerating-into-goal trajectory (steps shrink geometrically toward a 45deg
     goal). yaw converges to the goal heading, then FREEZES once ‖p[k+M]-p[k]‖ < eps,
