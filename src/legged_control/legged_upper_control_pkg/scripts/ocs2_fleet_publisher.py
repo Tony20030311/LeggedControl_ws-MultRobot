@@ -23,6 +23,8 @@ warmup-hold here. Formation / goals / w_form are params (default = stage-3 V).
 
 import os
 import sys
+import math
+import itertools
 
 import numpy as np
 import rospy
@@ -56,6 +58,35 @@ FORMATIONS = {
 }
 # default per-dog V slot goals (stage-3 V scenario).
 DEFAULT_GOALS = {1: (3.0, 0.0), 2: (2.3, 0.5), 3: (2.3, -0.5)}
+
+
+def rot2d(yaw):
+    """2D rotation matrix (world frame). Ported from the legacy Formation_manager."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.array([[c, -s], [s, c]])
+
+
+def centroid_slot_targets(goal_c, offsets, yaw):
+    """Legacy virtual-centroid command: given a formation-CENTROID goal, the (mean-
+    centred) V offsets, and a heading, return the per-slot world targets so the fleet
+    CENTROID lands on goal_c and the V faces `yaw`. slot[k] = goal_c + R(yaw)*offset_c[k].
+    Mean-centring makes goal_c the true centroid (not dog1). Pure math -- unit-testable."""
+    offs_c = [np.asarray(o, dtype=float) - np.mean(offsets, axis=0) for o in offsets]
+    R = rot2d(yaw)
+    return [np.asarray(goal_c, dtype=float) + R @ o for o in offs_c]
+
+
+def min_cost_assignment(positions, slots):
+    """One-shot nearest-slot assignment: the permutation of slot indices minimising
+    Σ‖pos[k]-slot[perm[k]]‖². Prevents the 180°-turn reshuffle without any hysteresis/
+    freeze machinery (which ADMM forbids). positions/slots are equal-length lists."""
+    best, bestcost = tuple(range(len(positions))), 1e18
+    for perm in itertools.permutations(range(len(slots))):
+        c = sum(float(np.dot(positions[k] - slots[perm[k]], positions[k] - slots[perm[k]]))
+                for k in range(len(positions)))
+        if c < bestcost:
+            bestcost, best = c, perm
+    return best
 
 # obstacle arenas (rung 2 basic arena): circular obstacles fed to the node CBF plus
 # matching per-dog goals. Each obstacle "pos" MUST match a cylinder in the Gazebo world
@@ -136,6 +167,8 @@ class FleetPublisher:
         # (node-local circular CBF); no walls in the open-field basic arena.
         lf = LaplacianFormation(FORMATIONS)
         lf.set_formation(self.formation_name)
+        self.formation = lf                              # kept for /formation/goal slotting
+        self._last_formation_yaw = 0.0                   # centroid->goal bearing memory
         self.coord = ac.ADMMCoordinator(dogs=tuple(self.dogs), edges=tuple(self.edges),
                                         obstacles=arena_obstacles, walls=arena_walls,
                                         formation=lf, w_form=self.w_form)
@@ -205,6 +238,9 @@ class FleetPublisher:
             # live re-targeting (demo tours): publish PoseStamped to /dogN/goal to send the
             # fleet to a new waypoint mid-run; forces an A* re-plan from the current pose.
             rospy.Subscriber("/%s/goal" % ns, PoseStamped, self._goal_cb, callback_args=i)
+        # virtual-centroid command (legacy behaviour): publish ONE PoseStamped to
+        # /formation/goal = the destination of the V CENTROID; it fans out to per-dog slots.
+        rospy.Subscriber("/formation/goal", PoseStamped, self._formation_goal_cb)
 
         # combined per-tick log (host reads via the mount) -- per-dog gt + commanded yaw.
         self._csv_path = rospy.get_param("~log_csv", os.path.join(
@@ -243,6 +279,38 @@ class FleetPublisher:
             self._yaw_latch[i] = None
         rospy.loginfo("[fleet_pub] dog%d new goal (%.2f,%.2f)",
                       i, self.goal[i][0], self.goal[i][1])
+
+    def _formation_goal_cb(self, msg):
+        """Virtual-centroid command (ported from legacy _goal_slot_targets): ONE
+        PoseStamped = where the V CENTROID should go. Fan out to per-dog slots
+        (V rotated to face travel dir), assign nearest slot per dog (one-shot, no
+        reshuffle on turn), then each dog A*'s to its slot -- find_reachable_goal
+        auto-snaps a slot that lands in/near an obstacle to the nearest safe point."""
+        if any(self.gt[i] is None for i in self.dogs):
+            rospy.logwarn("[fleet_pub] /formation/goal ignored: no state yet")
+            return
+        goal_c = np.array([msg.pose.position.x, msg.pose.position.y])
+        pos = [np.array([self.gt[i].pose.pose.position.x,
+                         self.gt[i].pose.pose.position.y]) for i in self.dogs]
+        centroid = np.mean(pos, axis=0)
+        d = goal_c - centroid
+        yaw = (math.atan2(d[1], d[0]) if float(np.linalg.norm(d)) > 0.25
+               else self._last_formation_yaw)
+        self._last_formation_yaw = yaw
+        offsets = self.formation.current_offsets
+        if offsets is None or len(offsets) != len(self.dogs):
+            rospy.logwarn("[fleet_pub] /formation/goal ignored: no formation offsets")
+            return
+        slots = centroid_slot_targets(goal_c, offsets, yaw)
+        assign = min_cost_assignment(pos, slots)
+        for k, i in enumerate(self.dogs):
+            self.goal[i] = slots[assign[k]]
+            self._path.pop(i, None)                  # force A* re-plan (auto-snaps unsafe slot)
+            if hasattr(self, "_yaw_latch"):
+                self._yaw_latch[i] = None
+        rospy.loginfo("[fleet_pub] /formation/goal centroid (%.2f,%.2f) yaw=%.2f -> %s",
+                      goal_c[0], goal_c[1], yaw,
+                      {i: self.goal[i].round(2).tolist() for i in self.dogs})
 
     def _ready(self):
         return all(self.obs[i] is not None and self.obs[i].time != 0.0
