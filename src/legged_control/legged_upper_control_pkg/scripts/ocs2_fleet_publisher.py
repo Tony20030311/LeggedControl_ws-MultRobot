@@ -364,11 +364,22 @@ class FleetPublisher:
             arr.markers.append(self._line_marker("obstacles", j,
                                                  self._circle_pts(cx, cy, o["radius"]),
                                                  (0.55, 0.55, 0.55), 0.03))
+        pos = {i: (self.gt[i].pose.pose.position.x, self.gt[i].pose.pose.position.y)
+               for i in self.dogs}
         for i in self.dogs:
             rgb = self._DOG_RGB.get(i, (1.0, 1.0, 1.0))
             pts = [(wpx[i][k], wpy[i][k], 0.1) for k in range(len(wpx[i]))]
-            arr.markers.append(self._line_marker("rollout", i, pts, rgb, 0.05))   # predicted path
-            arr.markers.append(self._sphere_marker("slot", i, self.goal[i], rgb))  # V slot goal
+            arr.markers.append(self._line_marker("rollout", i, pts, rgb, 0.05))     # predicted path
+            arr.markers.append(self._sphere_marker("dog", i, pos[i], rgb, d=0.22))  # current body
+            arr.markers.append(self._sphere_marker("slot", i, self.goal[i], rgb, d=0.12))  # V slot
+        # formation shape: connect the 3 current dog positions (the actual V / triangle)
+        edge_pts = []
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            edge_pts += [(pos[self.dogs[a]][0], pos[self.dogs[a]][1], 0.1),
+                         (pos[self.dogs[b]][0], pos[self.dogs[b]][1], 0.1)]
+        fm = self._line_marker("formation", 0, edge_pts, (1.0, 0.85, 0.1), 0.03)
+        fm.type = Marker.LINE_LIST                            # independent segments, not a strip
+        arr.markers.append(fm)
         self._marker_pub.publish(arr)
 
     def _ready(self):
