@@ -4,3 +4,7 @@ references/
 
 # local Claude Code hooks / settings
 .claude/
+
+# scratchpad: local demo runners, offline probes, videos -- machine-local scaffolding,
+# not part of the repo (the demo's substance lives in launch/, scripts/, legged_gazebo/)
+scratchpad/
