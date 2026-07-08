@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!-- Bundles the manual demo steps 4+5+6: kill the C++ target nodes, start the ADMM
+     fleet publisher (plum, radius 0.35, yaw cap, init goals = home so the dogs hold),
+     and open RViz showing the per-dog ADMM ROLLOUT + slot goals + peg circles.
+     Run AFTER: three_dogs_plum.launch -> fleet_bringup.launch -> start_fleet.sh trot.
+     Then command the fleet with ONE centroid point:
+       rostopic pub -1 /formation/goal geometry_msgs/PoseStamped \
+         "{header: {frame_id: 'world'}, pose: {position: {x: 9.0, y: 0.0, z: 0.5}}}" -->
+<launch>
+  <arg name="arena"        default="plum"/>
+  <arg name="v"            default="0.20"/>
+  <arg name="astar_radius" default="0.35"/>
+  <arg name="yaw_rate_max" default="1.2"/>
+  <arg name="rviz"         default="true"/>
+
+  <node pkg="legged_upper_control" type="ocs2_fleet_publisher.py"
+        name="ocs2_fleet_publisher" output="screen">
+    <param name="arena"             value="$(arg arena)"/>
+    <param name="use_astar"         value="true"/>
+    <param name="v"                 value="$(arg v)"/>
+    <param name="yaw_mode"          value="path"/>
+    <param name="astar_robot_radius" value="$(arg astar_radius)"/>
+    <param name="astar_x_max"       value="11.0"/>
+    <param name="yaw_rate_max"      value="$(arg yaw_rate_max)"/>
+    <param name="kill_cpp_target"   value="true"/>   <!-- step 4 -->
+    <param name="viz_markers"       value="true"/>   <!-- rollout markers -->
+    <!-- init goals = home slots: the fleet holds until the first /formation/goal -->
+    <param name="goal1_x" value="2.0"/><param name="goal1_y" value="0.0"/>
+    <param name="goal2_x" value="1.3"/><param name="goal2_y" value="0.5"/>
+    <param name="goal3_x" value="1.3"/><param name="goal3_y" value="-0.5"/>
+  </node>
+
+  <node if="$(arg rviz)" pkg="rviz" type="rviz" name="admm_rviz"
+        args="-d $(find legged_upper_control)/rviz/admm_demo.rviz"/>
+</launch>

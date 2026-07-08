@@ -31,7 +31,8 @@ import rospy
 from ocs2_msgs.msg import (mpc_target_trajectories, mpc_state, mpc_input,
                            mpc_observation)
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
+from visualization_msgs.msg import Marker, MarkerArray
 
 # rospy-free ADMM core (admm/) + core.formation (this node IS rospy, so it may import
 # core.formation and inject it -- keeping the coordinator itself rospy-free).
@@ -242,6 +243,24 @@ class FleetPublisher:
         # /formation/goal = the destination of the V CENTROID; it fans out to per-dog slots.
         rospy.Subscriber("/formation/goal", PoseStamped, self._formation_goal_cb)
 
+        # RViz debug: per-dog ADMM ROLLOUT (predicted trajectory) + slot goals + obstacle
+        # circles, all in one MarkerArray. Lets you watch the upper-layer plan, not just the
+        # body. (The legacy formation_debug_visualizer is Pure-Pursuit-only; this is native.)
+        self.viz = bool(rospy.get_param("~viz_markers", True))
+        self.viz_frame = rospy.get_param("~viz_frame", "world")
+        self._marker_pub = (rospy.Publisher("/formation/admm_markers", MarkerArray,
+                                            queue_size=1) if self.viz else None)
+        # let the ADMM publisher OWN the OCS2 target: kill the C++ legged_robot_target nodes
+        # that otherwise fight it on /dogN/..._mpc_target (was a manual `rosnode kill` step).
+        if bool(rospy.get_param("~kill_cpp_target", False)):
+            try:
+                import rosnode
+                killed, _ = rosnode.kill_nodes(["/dog%d/legged_robot_target" % i
+                                                for i in self.dogs])
+                rospy.loginfo("[fleet_pub] killed C++ target nodes: %s", killed)
+            except Exception as e:
+                rospy.logwarn("[fleet_pub] kill C++ targets failed: %s", e)
+
         # combined per-tick log (host reads via the mount) -- per-dog gt + commanded yaw.
         self._csv_path = rospy.get_param("~log_csv", os.path.join(
             _PKG, "docs", "progress", "fleet_track.csv"))
@@ -312,6 +331,46 @@ class FleetPublisher:
                       goal_c[0], goal_c[1], yaw,
                       {i: self.goal[i].round(2).tolist() for i in self.dogs})
 
+    # --- RViz debug markers (rollout + slots + obstacles) -----------------------------
+    _DOG_RGB = {1: (0.90, 0.20, 0.20), 2: (0.20, 0.80, 0.30), 3: (0.20, 0.45, 0.95)}
+
+    def _line_marker(self, ns, mid, pts, rgb, width):
+        m = Marker()
+        m.header.frame_id = self.viz_frame
+        m.ns = ns; m.id = mid; m.type = Marker.LINE_STRIP; m.action = Marker.ADD
+        m.scale.x = width; m.pose.orientation.w = 1.0
+        m.color.r, m.color.g, m.color.b = rgb; m.color.a = 1.0
+        m.points = [Point(x=float(x), y=float(y), z=float(z)) for x, y, z in pts]
+        return m
+
+    def _sphere_marker(self, ns, mid, xy, rgb, d=0.14):
+        m = Marker()
+        m.header.frame_id = self.viz_frame
+        m.ns = ns; m.id = mid; m.type = Marker.SPHERE; m.action = Marker.ADD
+        m.scale.x = m.scale.y = m.scale.z = d; m.pose.orientation.w = 1.0
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = float(xy[0]), float(xy[1]), 0.1
+        m.color.r, m.color.g, m.color.b = rgb; m.color.a = 1.0
+        return m
+
+    @staticmethod
+    def _circle_pts(cx, cy, r, n=24):
+        return [(cx + r * math.cos(2 * math.pi * k / n),
+                 cy + r * math.sin(2 * math.pi * k / n), 0.05) for k in range(n + 1)]
+
+    def _publish_markers(self, wpx, wpy):
+        arr = MarkerArray()
+        for j, o in enumerate(self.coord.obstacles):          # peg circles (grey)
+            cx, cy = o["pos"]
+            arr.markers.append(self._line_marker("obstacles", j,
+                                                 self._circle_pts(cx, cy, o["radius"]),
+                                                 (0.55, 0.55, 0.55), 0.03))
+        for i in self.dogs:
+            rgb = self._DOG_RGB.get(i, (1.0, 1.0, 1.0))
+            pts = [(wpx[i][k], wpy[i][k], 0.1) for k in range(len(wpx[i]))]
+            arr.markers.append(self._line_marker("rollout", i, pts, rgb, 0.05))   # predicted path
+            arr.markers.append(self._sphere_marker("slot", i, self.goal[i], rgb))  # V slot goal
+        self._marker_pub.publish(arr)
+
     def _ready(self):
         return all(self.obs[i] is not None and self.obs[i].time != 0.0
                    and self.gt[i] is not None for i in self.dogs)
@@ -374,6 +433,8 @@ class FleetPublisher:
                for i in self.dogs}
         wpy = {i: np.array([xi[i][C.py_index(k, self.N)] for k in range(1, self.N + 1)])
                for i in self.dogs}
+        if self._marker_pub is not None:
+            self._publish_markers(wpx, wpy)
 
         dbg = {}
         for i in self.dogs:
