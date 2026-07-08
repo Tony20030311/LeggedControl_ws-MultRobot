@@ -7,7 +7,6 @@ d = generate_distutils_setup(
         'legged_upper_control.core',
         'legged_upper_control.controllers',
         'legged_upper_control.fleet',
-        'legged_upper_control.apps',
     ],
     package_dir={'': '.'},
 )
