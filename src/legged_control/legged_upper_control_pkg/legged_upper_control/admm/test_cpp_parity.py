@@ -13,7 +13,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 import constants as PY  # noqa: E402
 import rti_linearizer as PY_RTI  # noqa: E402
+import node_subproblem as PY_NQ  # noqa: E402
+import edge_subproblem as PY_EQ  # noqa: E402
 
+import admm_core_cpp  # noqa: E402
 from admm_core_cpp import constants as CPP  # noqa: E402
 from admm_core_cpp import rti as CPP_RTI  # noqa: E402
 
@@ -102,6 +105,144 @@ def test_c2_linearize_edge_bit_identical():
                 pk, qk = np.asarray(p[key]), np.asarray(q[key])
                 assert pk.shape == qk.shape, (key, pk.shape, qk.shape)
                 assert np.array_equal(pk, qk), f"{key} differs (n={n})"
+
+
+# ---------------- C3: node / edge QP ----------------
+
+_OBSTACLES = [{"pos": (2.0, 0.15), "radius": 0.30},
+              {"pos": (3.1, -0.4), "radius": 0.45}]
+_WALLS = [{"normal": (0.0, 1.0), "point": (0.0, -1.5), "d_safe": 0.4}]
+
+
+def _mk_nodes(n, rho_consensus=0.0, n_neighbors=0, w_form=0.0):
+    py_n = PY_NQ.NodeSubproblem(obstacles=_OBSTACLES, walls=_WALLS, n=n,
+                                rho_consensus=rho_consensus,
+                                n_neighbors=n_neighbors, w_form=w_form)
+    cpp_n = admm_core_cpp.NodeSubproblem(obstacles=_OBSTACLES, walls=_WALLS, n=n,
+                                         rho_consensus=rho_consensus,
+                                         n_neighbors=n_neighbors, w_form=w_form)
+    return py_n, cpp_n
+
+
+def _node_inputs(rng, n):
+    x_now = rng.uniform(-0.3, 0.3, 4)
+    x_des = np.zeros((n, 4))
+    x_des[:, 0] = np.linspace(0.2, 4.0, n) + rng.uniform(-0.05, 0.05, n)
+    x_des[:, 1] = rng.uniform(-0.4, 0.4, n)
+    xbar = rng.uniform(-2.0, 4.0, PY.xi_dim(n))
+    ct = rng.uniform(-1.0, 1.0, PY.xi_dim(n))
+    fg = rng.uniform(-0.5, 0.5, (n, 2))
+    return x_now, x_des, xbar, ct, fg
+
+
+def test_c3_node_P_bit_identical():
+    for n in (10, 20):
+        for cons in ((0.0, 0), (PY.RHO, 2)):
+            py_n, cpp_n = _mk_nodes(n, rho_consensus=cons[0], n_neighbors=cons[1])
+            P = py_n._P
+            p, i, x = cpp_n._debug_P()
+            assert np.array_equal(P.indptr, np.asarray(p)), f"P indptr n={n}"
+            assert np.array_equal(P.indices, np.asarray(i)), f"P indices n={n}"
+            assert np.array_equal(P.data, np.asarray(x)), f"P data n={n}"
+
+
+def test_c3_node_assembly_bit_identical():
+    rng = np.random.default_rng(21)
+    for n in (10, 20):
+        py_n, cpp_n = _mk_nodes(n, rho_consensus=PY.RHO, n_neighbors=2, w_form=1.5)
+        for _ in range(50):
+            x_now, x_des, xbar, ct, fg = _node_inputs(rng, n)
+            q_py = py_n._q(x_des, consensus_target=ct, formation_grad=fg)
+            pbar, abar = py_n._operating_point(x_now, xbar)
+            A, up_cbf = py_n._assemble_A(pbar, abar)
+            lo, up = py_n._lu(x_now, up_cbf.copy())
+            d = cpp_n._debug_pass(x_now, x_des, xbar, consensus_target=ct,
+                                  formation_grad=fg)
+            ap, ai = cpp_n._debug_A_pattern()
+            assert np.array_equal(A.indptr, np.asarray(ap))
+            assert np.array_equal(A.indices, np.asarray(ai))
+            assert np.array_equal(A.data, np.asarray(d["Ax"])), "A data"
+            assert np.array_equal(q_py, np.asarray(d["q"])), "q"
+            assert np.array_equal(lo, np.asarray(d["lo"])), "lo"
+            assert np.array_equal(up, np.asarray(d["up"])), "up"
+
+
+def _bits_equal(a, b):
+    """Bitwise equality including NaN (an infeasible solve returns NaN-filled x;
+    NaN != NaN makes np.array_equal a false negative there)."""
+    a, b = np.ascontiguousarray(a, float), np.ascontiguousarray(b, float)
+    return a.shape == b.shape and a.tobytes() == b.tobytes()
+
+
+def test_c3_node_solve_bit_identical():
+    rng = np.random.default_rng(23)
+    for n in (10, 20):
+        py_n, cpp_n = _mk_nodes(n, rho_consensus=PY.RHO, n_neighbors=2, w_form=1.5)
+        x_now, x_des, _, ct, fg = _node_inputs(rng, n)
+        # cold start (xbar=None, soft warm-up path), then steady-state chain
+        rp = py_n.solve(x_now, x_des)
+        rc = cpp_n.solve(x_now, x_des)
+        assert rp["status"] == rc["status"], (rp["status"], rc["status"])
+        assert _bits_equal(rp["xi"], rc["xi"]), f"cold-start xi differs n={n}"
+        for step in range(4):
+            xbar = np.asarray(rp["xi"], float)[:PY.xi_dim(n)]
+            x_now2 = rng.uniform(-0.3, 0.3, 4)
+            rp = py_n.solve(x_now2, x_des, xbar=xbar, consensus_target=ct,
+                            formation_grad=fg)
+            rc = cpp_n.solve(x_now2, x_des, xbar=xbar, consensus_target=ct,
+                             formation_grad=fg)
+            assert rp["status"] == rc["status"], f"status step={step}"
+            assert _bits_equal(rp["xi"], rc["xi"]), f"steady xi differs step={step}"
+            if rp["a0"] is not None or rc["a0"] is not None:
+                assert _bits_equal(rp["a0"], rc["a0"])
+
+
+def _mk_edges(n, hard_through=1):
+    return (PY_EQ.EdgeSubproblem(n=n, hard_through=hard_through),
+            admm_core_cpp.EdgeSubproblem(n=n, hard_through=hard_through))
+
+
+def test_c3_edge_static_bit_identical():
+    for n in (10, 20):
+        for k_hard in (0, 1, 3):
+            py_e, cpp_e = _mk_edges(n, hard_through=k_hard)
+            p, i, x = cpp_e._debug_P()
+            assert np.array_equal(py_e._P.indptr, np.asarray(p))
+            assert np.array_equal(py_e._P.indices, np.asarray(i))
+            assert np.array_equal(py_e._P.data, np.asarray(x))
+            ap, ai, ax = cpp_e._debug_A()
+            assert np.array_equal(py_e._A.indptr, np.asarray(ap))
+            assert np.array_equal(py_e._A.indices, np.asarray(ai))
+            assert np.array_equal(py_e._A.data, np.asarray(ax))
+            lo, u = cpp_e._debug_lu()
+            assert np.array_equal(py_e._lo, np.asarray(lo))
+            assert np.array_equal(py_e._u, np.asarray(u))
+
+
+def test_c3_edge_solve_bit_identical():
+    rng = np.random.default_rng(31)
+    for n in (10, 20):
+        py_e, cpp_e = _mk_edges(n, hard_through=1)
+        for cycle in range(3):  # a fresh linearization per "control cycle"
+            args = _random_edge_inputs(rng, n)
+            fr = PY_RTI.linearize_edge(*args, n=n)
+            py_e.set_linearization(fr)
+            cpp_e.set_linearization(fr)
+            ap, ai, ax = cpp_e._debug_A()
+            assert np.array_equal(py_e._A.data, np.asarray(ax)), "frozen A data"
+            assert np.array_equal(py_e._u, np.asarray(cpp_e._debug_lu()[1]))
+            for it in range(4):  # ADMM iterations: q-only updates, warm-started
+                xi_i = rng.uniform(-2.0, 2.0, PY.xi_dim(n))
+                xi_j = rng.uniform(-2.0, 2.0, PY.xi_dim(n))
+                lam_i = rng.uniform(-0.5, 0.5, PY.xi_dim(n))
+                lam_j = rng.uniform(-0.5, 0.5, PY.xi_dim(n))
+                zp = py_e.solve(xi_i, xi_j, lam_i, lam_j)
+                zc = cpp_e.solve(xi_i, xi_j, lam_i, lam_j)
+                assert (zp[0] is None) == (zc[0] is None)
+                if zp[0] is not None:
+                    for a, b, name in zip(zp, zc, ("z_i", "z_j", "s")):
+                        assert np.array_equal(a, b), \
+                            f"{name} differs n={n} cycle={cycle} iter={it}"
 
 
 if __name__ == "__main__":

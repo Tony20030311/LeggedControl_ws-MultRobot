@@ -3,6 +3,8 @@
 // The Python module is the golden reference; keep formulas in lockstep, expression
 // by expression (operation order preserved for bit-identical doubles).
 // test_constants.py (parametrized over both implementations) is the gate.
+//
+// Constexpr values + index one-liners live here; matrix builders in constants.cpp.
 #include <Eigen/Dense>
 
 // OSQP's headers #define RHO (their default rho); it would shadow admm::RHO.
@@ -32,21 +34,8 @@ inline constexpr double MAX_AY = 1.0;
 inline constexpr double BD_POS_COEF = 0.5 * (TS * TS);  // mirrors 0.5 * TS**2
 inline constexpr double BD_VEL_COEF = TS;
 
-inline Eigen::Matrix4d make_Ad() {
-    Eigen::Matrix4d Ad = Eigen::Matrix4d::Identity();
-    Ad(0, 2) = TS;
-    Ad(1, 3) = TS;
-    return Ad;
-}
-
-inline Eigen::Matrix<double, 4, 2> make_Bd() {
-    Eigen::Matrix<double, 4, 2> Bd = Eigen::Matrix<double, 4, 2>::Zero();
-    Bd(0, 0) = BD_POS_COEF;
-    Bd(1, 1) = BD_POS_COEF;
-    Bd(2, 0) = BD_VEL_COEF;
-    Bd(3, 1) = BD_VEL_COEF;
-    return Bd;
-}
+Eigen::Matrix4d make_Ad();
+Eigen::Matrix<double, 4, 2> make_Bd();
 
 // --- second-order (Xiong) discrete HOCBF coefficients (文件二 C3) ---
 // g1 g2 is POSITIVE (from (1-g1)(1-g2)); a negative sign gives 0.31, off by 37%.
@@ -54,9 +43,7 @@ inline constexpr double COEF_HK2 = 1.0;
 inline constexpr double COEF_HK1 = -(2.0 - GAMMA1 - GAMMA2);
 inline constexpr double COEF_HK = 1.0 - GAMMA1 - GAMMA2 + GAMMA1 * GAMMA2;
 
-inline Eigen::Vector3d hocbf_coefs() {  // ordered [h_k, h_{k+1}, h_{k+2}]
-    return Eigen::Vector3d(COEF_HK, COEF_HK1, COEF_HK2);
-}
+Eigen::Vector3d hocbf_coefs();  // ordered [h_k, h_{k+1}, h_{k+2}]
 
 // --- exact a_k -> p_{k+2} / p_{k+1} and CBF-constraint scalars ---
 inline constexpr double A_TO_P2_COEF = 1.5 * (TS * TS);        // mirrors 1.5 * TS**2

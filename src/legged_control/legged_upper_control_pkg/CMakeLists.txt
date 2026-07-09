@@ -19,12 +19,24 @@ find_package(pybind11 QUIET CONFIG)
 find_package(osqp QUIET CONFIG)
 find_package(Eigen3 QUIET)
 if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
+  # core algorithm library (headers in include/, implementations in src/admm_core/;
+  # reused later by the roscpp node)
+  add_library(admm_core STATIC
+    src/admm_core/constants.cpp
+    src/admm_core/qp_common.cpp
+    src/admm_core/rti.cpp
+    src/admm_core/node_qp.cpp
+    src/admm_core/edge_qp.cpp
+  )
+  target_compile_features(admm_core PUBLIC cxx_std_17)
+  target_include_directories(admm_core PUBLIC include)
+  target_link_libraries(admm_core PUBLIC osqp::osqp Eigen3::Eigen)
+  set_target_properties(admm_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
   pybind11_add_module(admm_core_cpp
     src/admm_core/bindings.cpp
   )
-  target_compile_features(admm_core_cpp PRIVATE cxx_std_17)
-  target_include_directories(admm_core_cpp PRIVATE include)
-  target_link_libraries(admm_core_cpp PRIVATE osqp::osqp Eigen3::Eigen)
+  target_link_libraries(admm_core_cpp PRIVATE admm_core)
   set_target_properties(admm_core_cpp PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_PYTHON_DESTINATION})
   install(TARGETS admm_core_cpp
