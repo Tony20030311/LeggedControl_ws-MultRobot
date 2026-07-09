@@ -245,7 +245,7 @@ class FleetPublisher:
 
         # RViz debug: per-dog ADMM ROLLOUT (predicted trajectory) + slot goals + obstacle
         # circles, all in one MarkerArray. Lets you watch the upper-layer plan, not just the
-        # body. (The legacy formation_debug_visualizer is Pure-Pursuit-only; this is native.)
+        # body.
         self.viz = bool(rospy.get_param("~viz_markers", True))
         self.viz_frame = rospy.get_param("~viz_frame", "world")
         self._marker_pub = (rospy.Publisher("/formation/admm_markers", MarkerArray,

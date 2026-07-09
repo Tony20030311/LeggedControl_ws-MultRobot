@@ -91,9 +91,10 @@ second-order HOCBF, `/formation/goal` centroid command → OCS2 24D target). Run
 `three_dogs_{empty,obstacles,door,plum}.launch` + `admm_demo.launch` flows. Full rules:
 `legged_upper_control_pkg/CLAUDE.md`.
 
-**Support scripts in `legged_controllers/scripts/`:** `formation_debug_visualizer.py` (legacy
-RViz markers), `gait_broadcaster.py` (UDP gait, must start before fleet bringup; see Known
-Issues), `start_fleet.sh`, `Cbf_params_uqp.yaml`.
+**Support scripts in `legged_controllers/scripts/`:** `gait_broadcaster.py` (UDP gait, must
+start before fleet bringup; see Known Issues), `start_fleet.sh`. (The legacy
+`formation_debug_visualizer.py` + `Cbf_params_uqp.yaml` were deleted 2026-07-09; the ADMM
+publisher has native RViz markers on `/formation/admm_markers`.)
 
 > **DELETED 2026-07-09 (commit 522d77b/fb5aa6c) — don't look for these:** the monolithic
 > `Formation_manager_unified_{twoOrderCBF,qp}.py`, their debug launches, `scripts/archive/`, the
@@ -171,8 +172,7 @@ C++ / 1000 Hz       LeggedHWSim (Gazebo plugin): joint/IMU reads, hybrid impedan
 
 ## CBF Parameters
 
-- Modular: `legged_upper_control_pkg/config/Cbf_params_twoOrderCBF.yaml`
-- Legacy velocity-QP: `legged_controllers/scripts/Cbf_params_uqp.yaml` (`cbf_lookahead_tau`), still read by `formation_debug_visualizer.py`. (The monolith `Cbf_params_twoOrderCBF.yaml` copy was deleted; `config/Cbf_params_twoOrderCBF.yaml` is now the single copy.)
+- Modular: `legged_upper_control_pkg/config/Cbf_params_twoOrderCBF.yaml` — the single copy (the monolith copy and the legacy `Cbf_params_uqp.yaml` were deleted).
 - Common keys: `cbf_enabled`, `cbf_d_min`, `cbf_slack_enabled`/`slack_lambda`, formation `offsets`, `obstacles`/`walls` (manually tuned to match the Gazebo arena), `followers_stationary`.
 - `followers_stationary: true` is the safe default (followers hold position); set `false` for PID tracking only after the leader walks stably.
 
