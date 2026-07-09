@@ -253,13 +253,23 @@ class FleetPublisher:
         # let the ADMM publisher OWN the OCS2 target: kill the C++ legged_robot_target nodes
         # that otherwise fight it on /dogN/..._mpc_target (was a manual `rosnode kill` step).
         if bool(rospy.get_param("~kill_cpp_target", False)):
-            try:
-                import rosnode
-                killed, _ = rosnode.kill_nodes(["/dog%d/legged_robot_target" % i
-                                                for i in self.dogs])
-                rospy.loginfo("[fleet_pub] killed C++ target nodes: %s", killed)
-            except Exception as e:
-                rospy.logwarn("[fleet_pub] kill C++ targets failed: %s", e)
+            import rosnode
+            targets = ["/dog%d/legged_robot_target" % i for i in self.dogs]
+            killed = set()
+            for _ in range(20):                     # wait up to ~10s: the C++ targets may
+                try:                                # register slightly AFTER us (launch race)
+                    live = set(rosnode.get_node_names())
+                except Exception:
+                    live = set()
+                for t in [t for t in targets if t in live and t not in killed]:
+                    try:
+                        rosnode.kill_nodes([t]); killed.add(t)
+                    except Exception as e:
+                        rospy.logwarn("[fleet_pub] kill %s failed: %s", t, e)
+                if killed == set(targets):
+                    break
+                rospy.sleep(0.5)
+            rospy.loginfo("[fleet_pub] killed C++ target nodes: %s", sorted(killed))
 
         # combined per-tick log (host reads via the mount) -- per-dog gt + commanded yaw.
         self._csv_path = rospy.get_param("~log_csv", os.path.join(
@@ -337,6 +347,7 @@ class FleetPublisher:
     def _line_marker(self, ns, mid, pts, rgb, width):
         m = Marker()
         m.header.frame_id = self.viz_frame
+        m.lifetime = rospy.Duration(3 * self.ts)    # auto-clear if the publisher stops (no ghost)
         m.ns = ns; m.id = mid; m.type = Marker.LINE_STRIP; m.action = Marker.ADD
         m.scale.x = width; m.pose.orientation.w = 1.0
         m.color.r, m.color.g, m.color.b = rgb; m.color.a = 1.0
@@ -346,6 +357,7 @@ class FleetPublisher:
     def _sphere_marker(self, ns, mid, xy, rgb, d=0.14):
         m = Marker()
         m.header.frame_id = self.viz_frame
+        m.lifetime = rospy.Duration(3 * self.ts)
         m.ns = ns; m.id = mid; m.type = Marker.SPHERE; m.action = Marker.ADD
         m.scale.x = m.scale.y = m.scale.z = d; m.pose.orientation.w = 1.0
         m.pose.position.x, m.pose.position.y, m.pose.position.z = float(xy[0]), float(xy[1]), 0.1
@@ -372,11 +384,11 @@ class FleetPublisher:
             arr.markers.append(self._line_marker("rollout", i, pts, rgb, 0.05))     # predicted path
             arr.markers.append(self._sphere_marker("dog", i, pos[i], rgb, d=0.22))  # current body
             arr.markers.append(self._sphere_marker("slot", i, self.goal[i], rgb, d=0.12))  # V slot
-        # formation shape: connect the 3 current dog positions (the actual V / triangle)
+        # formation shape: connect every pair of current dog positions (complete graph =
+        # the leaderless formation; N-agnostic, no hardcoded 3-dog indexing)
         edge_pts = []
-        for a, b in ((0, 1), (1, 2), (2, 0)):
-            edge_pts += [(pos[self.dogs[a]][0], pos[self.dogs[a]][1], 0.1),
-                         (pos[self.dogs[b]][0], pos[self.dogs[b]][1], 0.1)]
+        for a, b in itertools.combinations(self.dogs, 2):
+            edge_pts += [(pos[a][0], pos[a][1], 0.1), (pos[b][0], pos[b][1], 0.1)]
         fm = self._line_marker("formation", 0, edge_pts, (1.0, 0.85, 0.1), 0.03)
         fm.type = Marker.LINE_LIST                            # independent segments, not a strip
         arr.markers.append(fm)
