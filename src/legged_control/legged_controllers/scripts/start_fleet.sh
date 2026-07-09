@@ -75,18 +75,4 @@ if [[ "$START_GAIT" != "none" ]]; then
         --connect-timeout "$GAIT_CONNECT_TIMEOUT"
 fi
 
-echo ""
-echo "======================================================================"
-echo "[start_fleet] Ready. Current gait request: $START_GAIT"
-echo ""
-echo "Default startup sends one zero cmd_vel pulse to stand up, then switches directly to trot."
-echo "No standing_trot warm-up is used."
-echo ""
-echo "To switch trot again manually:"
-echo "  rosrun legged_controllers gait_broadcaster.py trot"
-echo ""
-echo "Then send cmd_vel in another terminal:"
-echo "  rostopic pub -r 10 /dog1/cmd_vel geometry_msgs/Twist \"{linear: {x: 0.3}}\""
-echo "  rostopic pub -r 10 /dog2/cmd_vel geometry_msgs/Twist \"{linear: {x: 0.3}}\""
-echo "  rostopic pub -r 10 /dog3/cmd_vel geometry_msgs/Twist \"{linear: {x: 0.3}}\""
-echo "======================================================================"
+

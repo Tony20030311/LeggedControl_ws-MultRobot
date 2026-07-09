@@ -1,5 +1,5 @@
 #!/bin/bash
 xhost +local:root
-docker start 5cdd1d8f092e 
-docker exec -it 5cdd1d8f092e bash
+docker start 9a57e4b7e985 
+docker exec -it 9a57e4b7e985 bash
 
