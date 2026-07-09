@@ -34,6 +34,10 @@ if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
   target_compile_features(admm_core PUBLIC cxx_std_17)
   target_include_directories(admm_core PUBLIC include)
   target_link_libraries(admm_core PUBLIC osqp::osqp Eigen3::Eigen)
+  find_package(OpenMP QUIET)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(admm_core PUBLIC OpenMP::OpenMP_CXX)
+  endif()
   set_target_properties(admm_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
   pybind11_add_module(admm_core_cpp

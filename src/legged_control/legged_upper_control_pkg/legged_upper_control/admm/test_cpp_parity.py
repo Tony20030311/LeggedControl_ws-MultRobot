@@ -351,6 +351,35 @@ def _coordinator_chain(dogs, edges, with_formation, cycles=3):
         assert hp["edge_fail"] == hc["edge_fail"]
 
 
+def test_c5_parallel_equals_sequential():
+    """OpenMP parallel node/edge solves must be bit-identical to sequential —
+    each subproblem owns its OSQP workspace, so only wall-clock may change."""
+    rng = np.random.default_rng(53)
+    dogs, edges = (1, 2, 3), ((1, 2), (1, 3), (2, 3))
+    obstacles = [{"pos": (2.0, 0.2), "radius": 0.30}]
+    seq = CPP_AC.ADMMCoordinator(dogs=dogs, edges=edges, obstacles=obstacles,
+                                 hard_through=1, parallel=False)
+    par = CPP_AC.ADMMCoordinator(dogs=dogs, edges=edges, obstacles=obstacles,
+                                 hard_through=1, parallel=True)
+    N = PY.N
+    for cyc in range(3):
+        xnow = {d: np.array([rng.uniform(-0.1, 0.1), 1.0 * i, 0.0, 0.0])
+                for i, d in enumerate(dogs)}
+        xdes = {}
+        for i, d in enumerate(dogs):
+            xd = np.zeros((N, 4))
+            xd[:, 0] = np.linspace(0.2, 4.0, N)
+            xd[:, 1] = 1.0 * i
+            xdes[d] = xd
+        xs, hs = seq.step(xnow, xdes)
+        xp, hp = par.step(xnow, xdes)
+        for d in dogs:
+            assert _bits_equal(xs[d], xp[d]), f"parallel xi differs dog={d} cyc={cyc}"
+        for key in ("r_prim", "r_dual", "h2_viol"):
+            assert _bits_equal(np.asarray(hs[key]), np.asarray(hp[key])), key
+        assert hs["edge_fail"] == hp["edge_fail"]
+
+
 def test_c4_coordinator_two_dogs_bit_identical():
     _coordinator_chain(dogs=(1, 2), edges=((1, 2),), with_formation=False)
 

@@ -28,10 +28,12 @@ ADMMCoordinator::ADMMCoordinator(int p_iters, double rho, std::vector<int> dogs,
                                  std::vector<EdgeKey> edges,
                                  const LaplacianFormation* formation, double w_form,
                                  std::vector<Obstacle> obstacles,
-                                 std::vector<Wall> walls, int hard_through)
+                                 std::vector<Wall> walls, int hard_through,
+                                 bool parallel)
     : rho_(rho),
       P_(p_iters),
       hard_through_(hard_through),
+      parallel_(parallel),
       dogs_(std::move(dogs)),
       edges_(std::move(edges)),
       formation_(formation),
@@ -135,26 +137,65 @@ ADMMCoordinator::step(const std::map<int, Eigen::VectorXd>& xnow,
     std::map<int, Eigen::VectorXd> xi = xibar;
     Hist hist;
     EdgeVecs z_prev = z;
+
+    // Pre-fetch stable slot pointers so the OpenMP loops never touch std::map
+    // (map lookups/inserts are not thread-safe). Every entry already exists.
+    const int nd = static_cast<int>(dogs_.size());
+    const int ne = static_cast<int>(edges_.size());
+    std::vector<NodeSubproblem*> node_p(nd);
+    std::vector<const Eigen::VectorXd*> xnow_p(nd);
+    std::vector<const Eigen::MatrixXd*> xdes_p(nd);
+    std::vector<Eigen::VectorXd*> xibar_p(nd), xi_p(nd);
+    std::vector<const Eigen::MatrixX2d*> fg_p(nd, nullptr);
+    for (int idx = 0; idx < nd; ++idx) {
+        const int i = dogs_[idx];
+        node_p[idx] = node_[i].get();
+        xnow_p[idx] = &xnow.at(i);
+        xdes_p[idx] = &xdes.at(i);
+        xibar_p[idx] = &xibar[i];
+        xi_p[idx] = &xi[i];
+        if (use_fgrad) fg_p[idx] = &fgrad[i];
+    }
+    std::vector<EdgeSubproblem*> edge_p(ne);
+    std::vector<const Eigen::VectorXd*> exi_a(ne), exi_b(ne), elam_a(ne), elam_b(ne);
+    std::vector<Eigen::VectorXd*> ez_a(ne), ez_b(ne);
+    for (int idx = 0; idx < ne; ++idx) {
+        const EdgeKey& e = edges_[idx];
+        edge_p[idx] = edge_[e].get();
+        exi_a[idx] = &xi[e.first];
+        exi_b[idx] = &xi[e.second];
+        elam_a[idx] = &lam[e][e.first];
+        elam_b[idx] = &lam[e][e.second];
+        ez_a[idx] = &z[e][e.first];
+        ez_b[idx] = &z[e][e.second];
+    }
+
     for (int p = 0; p < P_; ++p) {
-        // node update (parallel over dogs)
-        for (const int i : dogs_) {
-            const Eigen::VectorXd ct = consensus_target(z, lam, i, neighbors_[i]);
-            const Eigen::MatrixX2d* fg = use_fgrad ? &fgrad[i] : nullptr;
-            const NodeSubproblem::Out r =
-                node_[i]->solve(xnow.at(i), xdes.at(i), &xibar[i], &ct, fg);
-            xi[i] = r.xi.head(nz);
+        // node update (parallel over dogs). ct depends only on z/lam, which are
+        // frozen during the node phase -> precompute, then solve concurrently.
+        std::vector<Eigen::VectorXd> cts(nd);
+        for (int idx = 0; idx < nd; ++idx)
+            cts[idx] = consensus_target(z, lam, dogs_[idx], neighbors_[dogs_[idx]]);
+        int edge_fail_round = 0;
+#pragma omp parallel for schedule(static) if (parallel_)
+        for (int idx = 0; idx < nd; ++idx) {
+            const NodeSubproblem::Out r = node_p[idx]->solve(
+                *xnow_p[idx], *xdes_p[idx], xibar_p[idx], &cts[idx], fg_p[idx]);
+            *xi_p[idx] = r.xi.head(nz);
         }
         // edge update (parallel over edges)
-        for (const EdgeKey& e : edges_) {
-            const EdgeSubproblem::Out o = edge_[e]->solve(
-                xi[e.first], xi[e.second], lam[e][e.first], lam[e][e.second]);
+#pragma omp parallel for schedule(static) reduction(+ : edge_fail_round) if (parallel_)
+        for (int idx = 0; idx < ne; ++idx) {
+            const EdgeSubproblem::Out o = edge_p[idx]->solve(
+                *exi_a[idx], *exi_b[idx], *elam_a[idx], *elam_b[idx]);
             if (!o.ok) {  // dead edge solve: keep the last z, flag it
-                hist.edge_fail += 1;
+                edge_fail_round += 1;
             } else {
-                z[e][e.first] = o.z_i;
-                z[e][e.second] = o.z_j;
+                *ez_a[idx] = o.z_i;
+                *ez_b[idx] = o.z_j;
             }
         }
+        hist.edge_fail += edge_fail_round;
         // dual update (scaled, NO rho factor)
         for (const EdgeKey& e : edges_) {
             lam[e][e.first] = lam[e][e.first] + (xi[e.first] - z[e][e.first]);

@@ -35,10 +35,13 @@ public:
 
     // formation: non-owning (nullptr = off); binding keeps the Python-side object
     // alive. obstacles/walls feed every node's local CBF.
+    // parallel: OpenMP over the (independent) node and edge solves inside each
+    // ADMM iteration. Results are bit-identical to sequential (own OSQP workspace
+    // per subproblem); only wall-clock changes. Default OFF.
     ADMMCoordinator(int p_iters, double rho, std::vector<int> dogs,
                     std::vector<EdgeKey> edges, const LaplacianFormation* formation,
                     double w_form, std::vector<Obstacle> obstacles,
-                    std::vector<Wall> walls, int hard_through);
+                    std::vector<Wall> walls, int hard_through, bool parallel = false);
 
     // One control cycle. xnow[i] = state4, xdes[i] = (N,4).
     std::pair<std::map<int, Eigen::VectorXd>, Hist> step(
@@ -66,6 +69,7 @@ private:
     double rho_;
     int P_;
     int hard_through_;
+    bool parallel_;
     std::vector<int> dogs_;
     std::vector<EdgeKey> edges_;
     const LaplacianFormation* formation_;
