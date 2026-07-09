@@ -20,7 +20,7 @@ from ..core.geometry import rot2d, wrap_to_pi, quaternion_to_yaw, closest_point_
 from ..core.state import RobotState, StateCollector
 from ..core.planning import AStarPlanner
 from ..core.navigation import PurePursuitController, LeaderCmdRelay, LeaderNavigator
-from ..core.formation import LaplacianFormation, FormationSwitcher
+from ..core.formation import LaplacianFormation
 from ..core.io import VelocityLimiter, CmdVelPublisher, AccelCmdPublisher, CbfDebugPublisher
 from ..controllers.accel_hocbf import TwoOrderCBFQPController
 from ..controllers.velocity_qp import UnifiedQPController
@@ -32,11 +32,10 @@ class FleetManagerUQP:
 
         1. StateCollector → 讀取三隻狗位置
         2. LeaderNavigator → virtual center 的 u_ref (A*+PP or joystick)
-        3. FormationSwitcher → 可能切換 L̂_des（自動偵測窄門）
-        4. LaplacianFormation → 計算 f 和 ∂f/∂p → 轉成 g (body frame)
-        5. TwoOrderCBFQPController → 解 acceleration QP → u_safe × 3
-        6. Follower wz: P control 對齊 leader yaw
-        7. VelocityLimiter + CmdVelPublisher → /dogN/cmd_vel
+        3. LaplacianFormation → 計算 f 和 ∂f/∂p → 轉成 g (body frame)
+        4. TwoOrderCBFQPController → 解 acceleration QP → u_safe × 3
+        5. Follower wz: P control 對齊 leader yaw
+        6. VelocityLimiter + CmdVelPublisher → /dogN/cmd_vel
     """
 
     @staticmethod
@@ -184,27 +183,6 @@ class FleetManagerUQP:
         default_formation = rospy.get_param(
             "~default_formation", _CFG.get("default_formation", "V"))
         self.laplacian.set_formation(default_formation)
-
-        # ── Module NEW-2: FormationSwitcher ──
-        door_enabled = rospy.get_param(
-            "~door_mode_enabled", _CFG.get("door_mode_enabled", True))
-        self.switcher = FormationSwitcher(
-            self.laplacian,
-            door_x=rospy.get_param("~door_x", _CFG.get("door_x", 6.0)),
-            default_formation=default_formation,
-            passage_formation=rospy.get_param(
-                "~door_passage_formation",
-                rospy.get_param(
-                    "~door_line_formation",
-                    _CFG.get(
-                        "door_passage_formation",
-                        _CFG.get("door_line_formation", "line")))),
-            trigger_dist=rospy.get_param(
-                "~door_trigger_dist", _CFG.get("door_trigger_dist", 3.0)),
-            release_dist=rospy.get_param(
-                "~door_release_dist", _CFG.get("door_release_dist", 2.0)),
-        )
-        self._door_enabled = door_enabled
 
         # ── Module 4': TwoOrderCBFQPController ──
         self.cbf_enabled = rospy.get_param(
@@ -494,9 +472,6 @@ class FleetManagerUQP:
                       self.pursuer.look_ahead, self.pursuer.v_cruise)
         rospy.loginfo("  formation   = '%s' (centroid-relative)",
                       self.laplacian.current_formation)
-        rospy.loginfo("  door_switch = %s at x=%.1f (trigger=%.1fm, release=%.1fm)",
-                      self._door_enabled, self.switcher.door_x,
-                      self.switcher._trigger_dist, self.switcher._release_dist)
         rospy.loginfo(
             "  QP weights  tracking=%.1f, formation=%.2f, accel_reg=%.2f (vel_reg removed)",
             self.qp.w_track, self.qp.w_formation, self.qp.w_accel)
@@ -620,22 +595,6 @@ class FleetManagerUQP:
             label=formation or "formation",
             fallback_to_base=self.astar_fallback_to_base_map,
         )
-
-    def _should_use_door_recovery(self, center_state):
-        goal = self.navigator.current_goal
-        if goal is None:
-            return False
-        door_x = self.switcher.door_x
-        center_side = -1 if center_state.x < door_x - 0.15 else (
-            1 if center_state.x > door_x + 0.15 else 0)
-        goal_side = -1 if goal[0] < door_x - 0.15 else (
-            1 if goal[0] > door_x + 0.15 else 0)
-        if center_side == 0:
-            return True
-        needs_crossing = (goal_side != 0 and center_side != goal_side)
-        if not needs_crossing:
-            return False
-        return abs(center_state.x - door_x) < (self.switcher._trigger_dist + 0.8)
 
     def _assignment_cost(self, positions, target_positions, assignment):
         cost = 0.0
@@ -1564,20 +1523,7 @@ class FleetManagerUQP:
                 rospy.loginfo("[FleetManagerUQP] Virtual-center mode → %s", mode)
                 _last_logged_mode[0] = mode
 
-            # ── 2. FormationSwitcher: 偵測是否需要切換隊形 ──
-            if self._door_enabled:
-                formation_changed = self.switcher.update(
-                    center_state, self.navigator.current_goal, states)
-                if formation_changed:
-                    self.qp.reset_prediction(
-                        "formation switched to %s" %
-                        self.laplacian.current_formation)
-                if formation_changed and self._per_dog_auto_active():
-                    self._reset_per_dog_paths(
-                        "formation switched to %s" %
-                        self.laplacian.current_formation)
-
-            # ── 3. Formation diagnostics + nominal velocity ──
+            # ── 2. Formation diagnostics + nominal velocity ──
             positions = [states[name].pos.copy() for name in self.all_dogs] 
             f_cost, formation_grad = self.laplacian.compute(positions) # 計算f cost + gradient 
             u_nominal, target_diag = self._build_nominal_velocity( # 計算 追A* Waypoint 的 pure persuit 速度 gain x error
@@ -1600,7 +1546,7 @@ class FleetManagerUQP:
                 rate.sleep()
                 continue
 
-            # ── 4. yaw tracking：per-dog AUTO 各狗追自己的 A* 路徑朝向；
+            # ── 3. yaw tracking：per-dog AUTO 各狗追自己的 A* 路徑朝向；
             #      keyboard/centroid 模式沒有 per-dog path,維持共同 formation yaw。
             wz_all = {}
             per_dog_yaw_active = self._per_dog_auto_active()
@@ -1614,7 +1560,7 @@ class FleetManagerUQP:
                 e_yaw = wrap_to_pi(desired_yaw - s.yaw)
                 wz_all[name] = self.kp_yaw_follower * e_yaw
 
-            # ── 5. 算 a_nom：上層二階 PD nominal acceleration，先 world 再轉 body ──
+            # ── 4. 算 a_nom：上層二階 PD nominal acceleration，先 world 再轉 body ──
             # a_nom^W = K_accel (p_d - p) + Kd_accel (v_d - v)
             # a_nom^B = R(psi)^T a_nom^W
             #
@@ -1627,7 +1573,7 @@ class FleetManagerUQP:
             #            趕路       → p_d = lookahead（沿 A* 路徑，給前進方向）
             #   latched → 純阻尼 a_nom = -Kd_accel·v（吃掉到點殘速 + trot 噪聲，
             #             乾淨停住；不再用 lookahead 持續往前推 → 根除拉扯）。
-            #   latch 狀態只讀不重算（步驟 3 的 u_nom 已更新好，避免雙重判定）。
+            #   latch 狀態只讀不重算（步驟 2 的 u_nom 已更新好，避免雙重判定）。
             #
             # 守衛：latched 是 per-dog AUTO 專屬狀態，只在 per-dog AUTO 模式才
             #       信任它。非 per-dog（keyboard/centroid）模式即使殘留舊 latch
@@ -1672,7 +1618,7 @@ class FleetManagerUQP:
                 a_d_body = rot2d(s.yaw).T @ a_d_world
                 a_desired[2 * idx:2 * idx + 2] = a_d_body
 
-            # ── 6. 解 pure second-order HOCBF acceleration QP ──
+            # ── 5. 解 pure second-order HOCBF acceleration QP ──
             # cbf_enabled 只控制安全 constraints；formation/path objective 仍會保留。
             control_dt = 1.0 / max(1e-3, float(self.rate_hz))
             u_safe = self.qp.solve(
@@ -1693,7 +1639,7 @@ class FleetManagerUQP:
                 self.qp.last_min_h_by_kind, self.qp.last_slack_by_kind,
                 vcmd, vact)
 
-            # ── 7. Velocity limiter + publish ──
+            # ── 6. Velocity limiter + publish ──
             bootstrap_key = (
                 self._dog_path_goal_key if self._per_dog_auto_active()
                 else None)
@@ -1716,14 +1662,14 @@ class FleetManagerUQP:
             if bootstrap_cmd_vel:
                 self._cmd_vel_bootstrap_key = bootstrap_key
 
-            # ── 8. Stuck detection（保留）──
+            # ── 7. Stuck detection（保留）──
             center_u_safe = np.mean(
                 np.array([u_safe[name] for name in self.all_dogs], dtype=float),
                 axis=0,
             )
             self._update_stuck_state(center_u_safe, states, center_state)
 
-            # ── 9. 診斷 log（每 2 秒一次）──
+            # ── 8. 診斷 log（每 2 秒一次）──
             if hasattr(self, '_log_counter'):
                 self._log_counter += 1
             else:
@@ -1763,7 +1709,7 @@ class FleetManagerUQP:
             rate.sleep()
 
     def _update_stuck_state(self, center_u_safe, states, center_state):
-        """Stuck detection（從舊版完整保留，recovery waypoint 改用 FormationSwitcher）"""
+        """Stuck detection（從舊版完整保留）"""
         if not self.navigator.has_goal:
             self._stuck_counter = 0
             self._consec_replans = 0
@@ -1795,13 +1741,6 @@ class FleetManagerUQP:
             self._stuck_counter = 0
             self._cooldown_counter = self.stuck_replan_cooldown
             return
-        if self._door_enabled and self._should_use_door_recovery(center_state):
-            via = self.switcher.recovery_waypoint(center_state)
-            if self.navigator.force_via_waypoint(tuple(center_state.pos), via, reason):
-                self._consec_replans += 1
-                self._stuck_counter = 0
-                self._cooldown_counter = self.stuck_replan_cooldown
-                return
         if self.navigator.force_replan(reason):
             self._consec_replans += 1
             self._stuck_counter = 0

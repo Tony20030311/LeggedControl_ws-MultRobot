@@ -216,14 +216,6 @@ debug_prediction_enabled: true
 debug_frame_id: "map"
 debug_obstacle_physical_radius: 0.20
 
-# ── 自動隊形切換（取代 DoorPassageManager）──
-door_mode_enabled: false
-door_x: 6.0
-door_passage_formation: "line"   # 過門切「單列」：硬 CBF 驗證證明 V_narrow 過門無解(infeasible)。
-door_line_formation: "line"      # 舊參數名相容,一起設 line。
-door_trigger_dist: 2.0    # 任一狗/centroid 距門 < 此值且需穿門 → 切窄三角形
-door_release_dist: 1.2   # 全隊離門 > 此值 → 切回 V
-
 # ── Stuck detection（從舊版保留）──
 stuck_speed_threshold: 0.05
 stuck_replan_cycles: 10
