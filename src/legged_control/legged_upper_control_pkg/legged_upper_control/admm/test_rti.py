@@ -20,7 +20,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import constants as C          # noqa: E402
-import rti_linearizer as rti   # noqa: E402
+# ADMM_IMPL=cpp runs this same gate against the C++ port (admm_core_cpp).
+if os.environ.get("ADMM_IMPL", "python") == "cpp":
+    from admm_core_cpp import rti  # noqa: E402
+else:
+    import rti_linearizer as rti   # noqa: E402
 
 
 def _make_xibar(pos_fn, acc, N=C.N):

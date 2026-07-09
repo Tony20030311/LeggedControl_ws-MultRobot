@@ -6,10 +6,16 @@
 #include <osqp.h>
 
 #include "legged_upper_control/admm_constants.hpp"  // #undef's OSQP's RHO macro
+#include "legged_upper_control/admm_rti.hpp"
 
 namespace py = pybind11;
 
 static Eigen::VectorXd roundtrip(const Eigen::VectorXd& x) { return x; }
+
+// n=None (Python default) -> admm::N; otherwise the explicit horizon.
+static int resolve_n(const py::object& n) {
+    return n.is_none() ? admm::N : n.cast<int>();
+}
 
 PYBIND11_MODULE(admm_core_cpp, m) {
     m.doc() = "ADMM-CBF-DMPC C++ core (staged port of legged_upper_control/admm)";
@@ -56,4 +62,45 @@ PYBIND11_MODULE(admm_core_cpp, m) {
     c.def("a_index", &admm::a_index, py::arg("k"), py::arg("n") = admm::N);
     c.def("ax_index", &admm::ax_index, py::arg("k"), py::arg("n") = admm::N);
     c.def("ay_index", &admm::ay_index, py::arg("k"), py::arg("n") = admm::N);
+
+    // --- C2: RTI linearizer (drop-in for `import rti_linearizer as rti`) ---
+    auto r = m.def_submodule("rti", "C++ mirror of admm/rti_linearizer.py");
+    r.def("edge_h",
+          [](const Eigen::VectorXd& e) {
+              return admm::edge_h(Eigen::Vector2d(e(0), e(1)));
+          },
+          py::arg("e"));
+    r.def("three_point", &admm::three_point,
+          py::arg("h0"), py::arg("h1"), py::arg("h2"));
+    r.def("shift_xi",
+          [](const Eigen::VectorXd& xi, const py::object& n) {
+              return admm::shift_xi(xi, resolve_n(n));
+          },
+          py::arg("xi"), py::arg("n") = py::none());
+    r.def("realized_hbar",
+          [](const Eigen::VectorXd& xi_i, const Eigen::VectorXd& xi_j,
+             const Eigen::VectorXd& xnow_i, const Eigen::VectorXd& xnow_j,
+             const py::object& n) {
+              return admm::realized_hbar(xi_i, xi_j, xnow_i, xnow_j, resolve_n(n));
+          },
+          py::arg("xi_i"), py::arg("xi_j"), py::arg("xnow_i"), py::arg("xnow_j"),
+          py::arg("n") = py::none());
+    r.def("linearize_edge",
+          [](const Eigen::VectorXd& xibar_i, const Eigen::VectorXd& xibar_j,
+             const Eigen::VectorXd& xnow_i, const Eigen::VectorXd& xnow_j,
+             const py::object& n) {
+              const admm::EdgeLin lin = admm::linearize_edge(
+                  xibar_i, xibar_j, xnow_i, xnow_j, resolve_n(n));
+              py::dict d;
+              d["g"] = lin.g;
+              d["u"] = lin.u;
+              d["Hbar"] = lin.Hbar;
+              d["abar_i"] = lin.abar_i;
+              d["abar_j"] = lin.abar_j;
+              d["e"] = lin.e;
+              d["N"] = lin.n;
+              return d;
+          },
+          py::arg("xibar_i"), py::arg("xibar_j"), py::arg("xnow_i"),
+          py::arg("xnow_j"), py::arg("n") = py::none());
 }
