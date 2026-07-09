@@ -14,6 +14,9 @@
 #include "legged_upper_control/admm_formation.hpp"
 #include "legged_upper_control/admm_motion_adapter.hpp"
 #include "legged_upper_control/admm_coordinator.hpp"
+#include "legged_upper_control/admm_reference.hpp"
+#include "legged_upper_control/astar_planner.hpp"
+#include "legged_upper_control/fleet_config.hpp"
 
 namespace py = pybind11;
 
@@ -50,6 +53,76 @@ static std::vector<admm::Wall> parse_walls(const py::object& walls) {
                        d_safe});
     }
     return out;
+}
+
+static std::vector<admm::AStarCircle> parse_astar_obstacles(const py::object& obstacles) {
+    std::vector<admm::AStarCircle> out;
+    if (obstacles.is_none()) return out;
+    for (const auto& item : obstacles.cast<py::list>()) {
+        const py::dict d = item.cast<py::dict>();
+        const py::sequence pos = d["pos"].cast<py::sequence>();
+        const double r = d.contains("astar_radius") ? d["astar_radius"].cast<double>()
+                                                    : d["radius"].cast<double>();
+        out.push_back({pos[0].cast<double>(), pos[1].cast<double>(), r});
+    }
+    return out;
+}
+
+static std::vector<admm::AStarRect> parse_astar_rects(const py::object& rects,
+                                                      double robot_radius) {
+    std::vector<admm::AStarRect> out;
+    if (rects.is_none()) return out;
+    for (const auto& item : rects.cast<py::list>()) {
+        const py::dict d = item.cast<py::dict>();
+        const py::sequence c = d["center"].cast<py::sequence>();
+        const py::sequence s = d["size"].cast<py::sequence>();
+        const double margin = d.contains("astar_margin")
+                                  ? d["astar_margin"].cast<double>()
+                                  : robot_radius;
+        out.push_back({c[0].cast<double>(), c[1].cast<double>(), s[0].cast<double>(),
+                       s[1].cast<double>(), margin});
+    }
+    return out;
+}
+
+// arena -> py dict with EXACTLY the publisher's literal shapes (tuples for points,
+// lists for collections, walls/rects keys only where the Python dict has them).
+static py::dict arena_to_py(const admm::Arena& a) {
+    py::dict d;
+    py::list obs;
+    for (const auto& o : a.obstacles) {
+        py::dict od;
+        od["pos"] = py::make_tuple(o.pos(0), o.pos(1));
+        od["radius"] = o.radius;
+        obs.append(od);
+    }
+    d["obstacles"] = obs;
+    if (!a.walls.empty()) {
+        py::list walls;
+        for (const auto& w : a.walls) {
+            py::dict wd;
+            wd["normal"] = py::make_tuple(w.normal(0), w.normal(1));
+            wd["point"] = py::make_tuple(w.point(0), w.point(1));
+            wd["d_safe"] = w.d_safe;
+            walls.append(wd);
+        }
+        d["walls"] = walls;
+    }
+    if (!a.rects.empty()) {
+        py::list rects;
+        for (const auto& r : a.rects) {
+            py::dict rd;
+            rd["center"] = py::make_tuple(r.center(0), r.center(1));
+            rd["size"] = py::make_tuple(r.size(0), r.size(1));
+            rects.append(rd);
+        }
+        d["rects"] = rects;
+    }
+    py::dict goals;
+    for (const auto& kv : a.goals)
+        goals[py::cast(kv.first)] = py::make_tuple(kv.second(0), kv.second(1));
+    d["goals"] = goals;
+    return d;
 }
 
 static py::object node_out_to_py(const admm::NodeSubproblem::Out& o) {
@@ -548,4 +621,101 @@ PYBIND11_MODULE(admm_core_cpp, m) {
                  return py::make_tuple(xi, hist);
              },
              py::arg("xnow"), py::arg("xdes"));
+
+    // ---------------- C6: reference (admm/reference.py) ----------------
+    auto ref = m.def_submodule("reference", "C++ mirror of admm/reference.py");
+    ref.def("point_at_arclength", &admm::point_at_arclength,
+            "Point on the polyline at arc length s (clamped to [0, L])",
+            py::arg("wp"), py::arg("cum"), py::arg("s"));
+    ref.def("build_reference",
+            [](const Eigen::Vector2d& cur_pos, const Eigen::MatrixX2d& waypoints,
+               const py::object& n, const py::object& ts, double v_cruise,
+               double d_brake) {
+                return admm::build_reference(
+                    cur_pos, waypoints, resolve_n(n),
+                    ts.is_none() ? admm::TS : ts.cast<double>(), v_cruise, d_brake);
+            },
+            "N position anchors ahead of cur_pos: (n,4) rows [px, py, 0, 0]",
+            py::arg("cur_pos"), py::arg("waypoints"), py::arg("n") = py::none(),
+            py::arg("ts") = py::none(), py::arg("v_cruise") = 0.30,
+            py::arg("d_brake") = 0.80);
+
+    // ---------------- C6: A* planner (core/planning.py, used subset) ----------------
+    m.def("py_hypot", &admm::py_hypot,
+          "CPython 3.8 math.hypot mirror (scaled compensated sum, NOT libm hypot)",
+          py::arg("x"), py::arg("y"));
+    py::class_<admm::AStarPlanner>(m, "AStarPlanner")
+        .def(py::init([](double resolution, double robot_radius,
+                         const py::object& obstacles, double x_min, double x_max,
+                         double y_min, double y_max, double boundary_margin,
+                         const py::object& rect_obstacles) {
+                 return admm::AStarPlanner(
+                     resolution, robot_radius, parse_astar_obstacles(obstacles),
+                     x_min, x_max, y_min, y_max, boundary_margin,
+                     parse_astar_rects(rect_obstacles, robot_radius));
+             }),
+             py::arg("resolution"), py::arg("robot_radius"), py::arg("obstacles"),
+             py::arg("x_min") = 0.0, py::arg("x_max") = 10.0,
+             py::arg("y_min") = -5.0, py::arg("y_max") = 5.0,
+             py::arg("boundary_margin") = 0.45,
+             py::arg("rect_obstacles") = py::none())
+        .def("plan",
+             [](const admm::AStarPlanner& self, const Eigen::Vector2d& start,
+                const Eigen::Vector2d& goal) {
+                 py::list out;
+                 for (const auto& p : self.plan(start, goal))
+                     out.append(py::make_tuple(p(0), p(1)));
+                 return out;
+             },
+             py::arg("start"), py::arg("goal"))
+        .def("find_reachable_goal",
+             [](const admm::AStarPlanner& self, const Eigen::Vector2d& start,
+                const Eigen::Vector2d& goal) {
+                 const auto r = self.find_reachable_goal(start, goal);
+                 py::list path;
+                 for (const auto& p : r.path)
+                     path.append(py::make_tuple(p(0), p(1)));
+                 py::object cand =
+                     r.has_candidate
+                         ? py::object(py::make_tuple(r.candidate(0), r.candidate(1)))
+                         : py::object(py::none());
+                 return py::make_tuple(cand, path);
+             },
+             py::arg("start"), py::arg("goal"))
+        .def("_debug_omap", [](const admm::AStarPlanner& self) {
+            Eigen::MatrixXi omap(self.nx(), self.ny());
+            for (int i = 0; i < self.nx(); ++i)
+                for (int j = 0; j < self.ny(); ++j)
+                    omap(i, j) = self.omap()[static_cast<size_t>(i) * self.ny() + j];
+            return omap;
+        });
+
+    // ---------------- C6: fleet config (ocs2_fleet_publisher.py module level) ----
+    {
+        py::dict arenas;
+        for (const auto& kv : admm::arenas()) arenas[py::cast(kv.first)] = arena_to_py(kv.second);
+        m.attr("ARENAS") = arenas;
+        py::dict formations;
+        for (const auto& kv : admm::formations()) {
+            py::list offs;
+            for (const auto& o : kv.second) offs.append(py::make_tuple(o(0), o(1)));
+            formations[py::cast(kv.first)] = offs;
+        }
+        m.attr("FORMATIONS") = formations;
+        py::dict goals;
+        for (const auto& kv : admm::default_goals())
+            goals[py::cast(kv.first)] = py::make_tuple(kv.second(0), kv.second(1));
+        m.attr("DEFAULT_GOALS") = goals;
+    }
+    m.def("rot2d", &admm::rot2d, "2D rotation matrix (world frame)", py::arg("yaw"));
+    m.def("centroid_slot_targets", &admm::centroid_slot_targets,
+          "Per-slot world targets: centroid on goal_c, V facing yaw",
+          py::arg("goal_c"), py::arg("offsets"), py::arg("yaw"));
+    m.def("min_cost_assignment",
+          [](const std::vector<Eigen::Vector2d>& positions,
+             const std::vector<Eigen::Vector2d>& slots) {
+              return py::tuple(py::cast(admm::min_cost_assignment(positions, slots)));
+          },
+          "Slot permutation minimising sum of squared distances",
+          py::arg("positions"), py::arg("slots"));
 }

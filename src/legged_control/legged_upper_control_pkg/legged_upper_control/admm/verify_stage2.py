@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from admm_impl import constants as C  # noqa: E402
 from admm_impl import ac  # noqa: E402
-import reference as ref          # noqa: E402
+from admm_impl import reference as ref  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PNG = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress",

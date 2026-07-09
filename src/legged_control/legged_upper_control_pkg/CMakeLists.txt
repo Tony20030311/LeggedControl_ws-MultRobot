@@ -30,6 +30,9 @@ if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
     src/admm_core/formation.cpp
     src/admm_core/motion_adapter.cpp
     src/admm_core/coordinator.cpp
+    src/admm_core/reference.cpp
+    src/admm_core/astar_planner.cpp
+    src/admm_core/fleet_config.cpp
   )
   target_compile_features(admm_core PUBLIC cxx_std_17)
   target_include_directories(admm_core PUBLIC include)

@@ -51,7 +51,7 @@ sys.path.insert(0, HERE)                     # admm/ -> constants, coordinator, 
 from admm_impl import constants as C  # noqa: E402
 from admm_impl import ac  # noqa: E402
 from admm_impl import nq  # noqa: E402
-from reference import build_reference         # noqa: E402
+from admm_impl import build_reference         # noqa: E402
 from admm_impl import LaplacianFormation  # noqa: E402
 
 PNG_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress"))

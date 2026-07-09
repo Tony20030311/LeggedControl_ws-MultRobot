@@ -6,7 +6,7 @@ import os, sys
 import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "..", "..", "scripts"))
-from ocs2_fleet_publisher import centroid_slot_targets, min_cost_assignment, rot2d, FORMATIONS
+from admm_impl import centroid_slot_targets, min_cost_assignment, rot2d, FORMATIONS
 
 V = FORMATIONS["V"]                       # [(0,0),(-0.7,0.5),(-0.7,-0.5)]
 

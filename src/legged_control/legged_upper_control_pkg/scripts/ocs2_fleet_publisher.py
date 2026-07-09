@@ -40,12 +40,12 @@ _PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ADMM = os.path.join(_PKG, "legged_upper_control", "admm")
 sys.path.insert(0, _ADMM)
 sys.path.insert(0, os.path.join(_PKG, "legged_upper_control"))   # core.formation
-import motion_adapter as ma            # noqa: E402
-import constants as C                  # noqa: E402
-import admm_coordinator as ac          # noqa: E402
-from reference import build_reference  # noqa: E402
-from core.formation import LaplacianFormation  # noqa: E402
-from core.planning import AStarPlanner  # noqa: E402  (dense-arena curved refs)
+from admm_impl import ma               # noqa: E402  (ADMM_IMPL=cpp -> C++ core)
+from admm_impl import constants as C   # noqa: E402
+from admm_impl import ac               # noqa: E402
+from admm_impl import build_reference  # noqa: E402
+from admm_impl import LaplacianFormation  # noqa: E402
+from admm_impl import AStarPlanner     # noqa: E402  (dense-arena curved refs)
 
 # A1 standing pose (same placeholder as the single-dog publisher).
 A1_DEFAULT_JOINTS = [0.1, 0.8, -1.5, -0.1, 0.8, -1.5,

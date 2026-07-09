@@ -37,11 +37,11 @@ sys.path.insert(0, HERE)                                   # admm/
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "scripts"))  # publisher
 from admm_impl import constants as C  # noqa: E402
 from admm_impl import ac  # noqa: E402
-from reference import build_reference                       # noqa: E402
+from admm_impl import build_reference                       # noqa: E402
 from admm_impl import LaplacianFormation  # noqa: E402
-from core.planning import AStarPlanner                      # noqa: E402
+from admm_impl import AStarPlanner                      # noqa: E402
 import verify_arena as va                                   # noqa: E402  (reuse realized_* + gate + _plot)
-from ocs2_fleet_publisher import ARENAS, FORMATIONS         # noqa: E402  (single source of truth)
+from admm_impl import ARENAS, FORMATIONS         # noqa: E402  (single source of truth)
 
 PNG_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress"))
 DOGS = (1, 2, 3)

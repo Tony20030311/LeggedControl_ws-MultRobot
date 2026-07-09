@@ -5,6 +5,7 @@ Run (inside the SIL container, devel sourced):
     python3 legged_upper_control/admm/test_cpp_parity.py
 """
 
+import math
 import os
 import sys
 
@@ -17,15 +18,29 @@ import node_subproblem as PY_NQ  # noqa: E402
 import edge_subproblem as PY_EQ  # noqa: E402
 import admm_coordinator as PY_AC  # noqa: E402
 import motion_adapter as PY_MA  # noqa: E402
+import reference as PY_REF  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.formation import LaplacianFormation as PyFormation  # noqa: E402
+from core.planning import AStarPlanner as PyAStar  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "scripts"))
+from ocs2_fleet_publisher import ARENAS as PUB_ARENAS  # noqa: E402
+from ocs2_fleet_publisher import (  # noqa: E402
+    DEFAULT_GOALS as PUB_DEFAULT_GOALS,
+    FORMATIONS as PUB_FORMATIONS,
+    centroid_slot_targets as py_centroid_slot_targets,
+    min_cost_assignment as py_min_cost_assignment,
+    rot2d as py_rot2d,
+)
 
 import admm_core_cpp  # noqa: E402
 from admm_core_cpp import constants as CPP  # noqa: E402
 from admm_core_cpp import rti as CPP_RTI  # noqa: E402
 from admm_core_cpp import motion_adapter as CPP_MA  # noqa: E402
 from admm_core_cpp import coordinator as CPP_AC  # noqa: E402
+from admm_core_cpp import reference as CPP_REF  # noqa: E402
 
 _SCALARS = [
     "N", "TS", "GAMMA1", "GAMMA2", "N_X", "N_U", "XI_DIM",
@@ -387,6 +402,143 @@ def test_c4_coordinator_two_dogs_bit_identical():
 def test_c4_coordinator_three_dogs_formation_bit_identical():
     _coordinator_chain(dogs=(1, 2, 3), edges=((1, 2), (1, 3), (2, 3)),
                        with_formation=True)
+
+
+# ---------------- C6: reference / A* / fleet config ----------------
+
+
+def _c6_polylines(rng):
+    grid = [[0.0, 0.0]]
+    for k in range(1, 12):  # A*-shaped: axis + diagonal 0.15 m grid steps
+        p = grid[-1]
+        step = (0.15, 0.0) if k % 3 else (0.15, 0.15)
+        grid.append([p[0] + step[0], p[1] + step[1]])
+    polys = [
+        [[0.0, 0.0], [4.0, 0.0]],                           # straight 2-pt
+        grid,                                               # grid polyline
+        [[0.0, 0.0], [1.0, 0.5], [1.0, 0.5], [2.0, -0.3]],  # duplicate wp (seg<1e-12)
+        [[0.2, -0.1], [0.2, -0.1]],                         # fully degenerate, L=0
+    ]
+    for _ in range(30):  # random jagged polylines
+        m = int(rng.integers(2, 9))
+        polys.append(np.cumsum(rng.uniform(-0.4, 0.6, (m, 2)), axis=0).tolist())
+    return polys
+
+
+def test_c6_reference_bit_identical():
+    rng = np.random.default_rng(61)
+    for poly in _c6_polylines(rng):
+        wp, cum = PY_REF._cumulative(poly)
+        L = cum[-1]
+        for s in (-1.0, 0.0, 0.3 * L, L, L + 2.0, *cum.tolist()):
+            assert _bits_equal(PY_REF.point_at_arclength(wp, cum, s),
+                               CPP_REF.point_at_arclength(wp, cum, s)), \
+                f"point_at_arclength s={s}"
+        for cur in ([0.0, 0.0], wp[0], wp[-1],
+                    rng.uniform(-1.0, 3.0, 2), rng.uniform(-1.0, 3.0, 2)):
+            for kw in ({}, {"n": 20, "ts": 0.2},
+                       {"v_cruise": 0.15, "d_brake": 0.5},
+                       {"d_brake": 0.0}):  # d_brake<=1e-9 branch
+                assert _bits_equal(PY_REF.build_reference(cur, poly, **kw),
+                                   CPP_REF.build_reference(cur, poly, **kw)), \
+                    f"build_reference cur={cur} kw={kw}"
+
+
+# exact ctor args of the real ADMM-side callers (verify_plum / verify_door / publisher)
+_ASTAR_CASES = {
+    "plum": dict(resolution=0.15, robot_radius=0.35,
+                 obstacles=[{"pos": o["pos"], "radius": o["radius"]}
+                            for o in PUB_ARENAS["plum"]["obstacles"]],
+                 x_min=0.0, x_max=10.0, y_min=-4.0, y_max=4.0),
+    "door": dict(resolution=0.15, robot_radius=0.35,
+                 obstacles=[{"pos": o["pos"], "radius": o["radius"]}
+                            for o in PUB_ARENAS["door"]["obstacles"]],
+                 x_min=0.0, x_max=10.0, y_min=-5.0, y_max=5.0,
+                 rect_obstacles=PUB_ARENAS["door"]["rects"]),
+}
+_ASTAR_START = {1: (2.0, 0.0), 2: (1.0, 1.0), 3: (1.0, -1.0)}
+
+
+def test_c6_astar_hypot_bit_identical():
+    # math.hypot is CPython's scaled compensated sum, NOT libm hypot (~70% of
+    # random float pairs differ in the last bit) — the C++ port must mirror it.
+    for dx in range(-160, 161):
+        for dy in range(-160, 161):
+            assert admm_core_cpp.py_hypot(float(dx), float(dy)) == math.hypot(dx, dy)
+    rng = np.random.default_rng(67)
+    for lo, hi in ((-20.0, 20.0), (-1e6, 1e6), (-1e-6, 1e-6)):
+        for _ in range(30000):
+            x, y = rng.uniform(lo, hi), rng.uniform(-20.0, 20.0)
+            assert admm_core_cpp.py_hypot(x, y) == math.hypot(x, y), (x, y)
+
+
+def _paths_equal(pp, pc, label):
+    assert len(pp) == len(pc), f"{label}: len {len(pp)} vs {len(pc)}"
+    if pp:
+        assert _bits_equal(np.asarray(pp, float), np.asarray(pc, float)), label
+
+
+def test_c6_astar_bit_identical():
+    rng = np.random.default_rng(71)
+    for name, kwargs in _ASTAR_CASES.items():
+        py_p, cpp_p = PyAStar(**kwargs), admm_core_cpp.AStarPlanner(**kwargs)
+        assert np.array_equal(py_p._omap.astype(np.int32),
+                              np.asarray(cpp_p._debug_omap())), f"{name} omap"
+        goals = PUB_ARENAS[name]["goals"]
+        starts_goals = [( _ASTAR_START[i], goals[i]) for i in (1, 2, 3)]
+        for k in range(60):  # fuzz: arbitrary pairs; 1/3 of goals inside obstacles
+            s = (rng.uniform(kwargs["x_min"], kwargs["x_max"]),
+                 rng.uniform(kwargs["y_min"], kwargs["y_max"]))
+            if k % 3 == 0:
+                o = kwargs["obstacles"][int(rng.integers(len(kwargs["obstacles"])))]
+                g = (o["pos"][0] + rng.uniform(-0.2, 0.2),
+                     o["pos"][1] + rng.uniform(-0.2, 0.2))
+            else:
+                g = (rng.uniform(kwargs["x_min"], kwargs["x_max"]),
+                     rng.uniform(kwargs["y_min"], kwargs["y_max"]))
+            starts_goals.append((s, g))
+        for j, (s, g) in enumerate(starts_goals):
+            _paths_equal(py_p.plan(s, g), cpp_p.plan(s, g), f"{name} plan {j}")
+            cp, pp = py_p.find_reachable_goal(s, g)
+            cc, pc = cpp_p.find_reachable_goal(s, g)
+            assert (cp is None) == (cc is None), f"{name} frg cand {j}"
+            if cp is not None:
+                assert _bits_equal(np.asarray(cp, float), np.asarray(cc, float)), \
+                    f"{name} frg cand val {j}"
+            _paths_equal(pp, pc, f"{name} frg path {j}")
+
+
+def test_c6_fleet_data_identical():
+    # single source of truth moves to C++ — the py dicts must match EXACTLY
+    # (tuple-vs-list shapes included) so verify gates keep working unchanged.
+    assert admm_core_cpp.ARENAS == PUB_ARENAS
+    assert admm_core_cpp.FORMATIONS == PUB_FORMATIONS
+    assert admm_core_cpp.DEFAULT_GOALS == PUB_DEFAULT_GOALS
+
+
+def test_c6_fleet_math_bit_identical():
+    rng = np.random.default_rng(73)
+    for _ in range(300):
+        yaw = rng.uniform(-8.0, 8.0)
+        assert _bits_equal(py_rot2d(yaw), admm_core_cpp.rot2d(yaw)), yaw
+        goal_c = rng.uniform(-5.0, 10.0, 2)
+        offsets = PUB_FORMATIONS[("V", "column", "V_wide")[int(rng.integers(3))]]
+        sp = py_centroid_slot_targets(goal_c, offsets, yaw)
+        sc = admm_core_cpp.centroid_slot_targets(goal_c, offsets, yaw)
+        assert len(sp) == len(sc)
+        for a, b in zip(sp, sc):
+            assert _bits_equal(a, b), (goal_c, yaw)
+        positions = [rng.uniform(-2.0, 8.0, 2) for _ in range(3)]
+        slots = [rng.uniform(-2.0, 8.0, 2) for _ in range(3)]
+        assert (py_min_cost_assignment(positions, slots)
+                == tuple(admm_core_cpp.min_cost_assignment(positions, slots)))
+    # permutation ties: strict < keeps the FIRST (lexicographic) minimum
+    pts = [np.array([0.0, 0.0]), np.array([1.0, 0.0]), np.array([2.0, 0.0])]
+    assert (py_min_cost_assignment(pts, pts)
+            == tuple(admm_core_cpp.min_cost_assignment(pts, pts)) == (0, 1, 2))
+    twin = [np.array([0.0, 0.0]), np.array([0.0, 0.0]), np.array([3.0, 3.0])]
+    assert (py_min_cost_assignment(pts, twin)
+            == tuple(admm_core_cpp.min_cost_assignment(pts, twin)))
 
 
 if __name__ == "__main__":

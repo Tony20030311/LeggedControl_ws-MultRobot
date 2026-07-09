@@ -27,7 +27,7 @@ sys.path.insert(0, HERE)
 from admm_impl import constants as C  # noqa: E402
 from admm_impl import nq  # noqa: E402
 from admm_impl import ma  # noqa: E402
-from reference import build_reference  # noqa: E402
+from admm_impl import build_reference  # noqa: E402
 
 PNG = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress",
                                     "stage4_adapter.png"))
