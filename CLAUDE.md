@@ -8,8 +8,11 @@ Three Unitree A1 quadruped robots in multi-robot formation control research.
 Stack: ROS Noetic + Gazebo + OCS2 (MPC/WBC).
 
 **Development scope: only modify Python — the upper-control layer (L1–L4). Two locations hold it:**
-- `src/legged_control/legged_upper_control_pkg/` — the current modular package (preferred)
-- `src/legged_control/legged_controllers/scripts/` — the monolithic single-file managers + debug/gait tools
+- `src/legged_control/legged_upper_control_pkg/` — the current package: the ADMM system
+  (`scripts/ocs2_fleet_publisher.py` + `legged_upper_control/admm/`, the ACTIVE upper control)
+  and the legacy modular Pure-Pursuit stack (`legged_upper_control/{core,controllers,fleet}`)
+- `src/legged_control/legged_controllers/scripts/` — the RViz debug visualizer, the gait
+  broadcaster, and `start_fleet.sh` (the monolithic single-file managers were **deleted** — see below)
 
 **Never touch C++ under `src/` (OCS2, legged_control, pinocchio, hpp-fcl).** The L0 MPC/WBC is fixed.
 
@@ -79,15 +82,23 @@ The same L1–L4 stack exists in two forms. Know which you are editing.
 | `launch/formation_hocbf.launch` | Launches fleet manager + debug visualizer |
 | `config/Cbf_params_twoOrderCBF.yaml` | Params for the modular HOCBF path |
 
-**B. Monolithic scripts — `legged_controllers/scripts/` (single-file equivalents):**
-- `Formation_manager_unified_twoOrderCBF.py` — A*, PurePursuit, LeaderNavigator, `TwoOrderCBFQPController`, `FleetManagerUQP`, all in one file (HOCBF/acceleration-level)
-- `Formation_manager_unified_qp.py` — velocity-level unified-QP variant
-- `formation_debug_visualizer.py` — RViz markers for A* paths, CBF h-min, obstacles
-- `gait_broadcaster.py` — UDP gait broadcaster (must start before fleet bringup; see Known Issues)
-- `start_fleet.sh` — stand up + switch to trot for all dogs
-- `archive/` — old versions (`formation_managerCBF.py`, `formation_managerCBF_door.py`, `fleet_manager.py`); reference only, do not extend
+Section A is the **legacy Pure-Pursuit stack**, now launched only by `formation_hocbf.launch`
+and being retired as the ADMM system takes over. The active system is the ADMM publisher:
 
-The modular package is the refactor target; the monolith is the historical/working single-file version. They duplicate logic — see the duplication warning below.
+**B. ADMM upper-control (the ACTIVE system) — `legged_upper_control_pkg/scripts/ocs2_fleet_publisher.py` + `legged_upper_control/admm/`:**
+trajectory-level ADMM-DMPC fleet publisher (world-frame double integrator, node-edge splitting,
+second-order HOCBF, `/formation/goal` centroid command → OCS2 24D target). Run by the
+`three_dogs_{empty,obstacles,door,plum}.launch` + `admm_demo.launch` flows. Full rules:
+`legged_upper_control_pkg/CLAUDE.md`.
+
+**Support scripts in `legged_controllers/scripts/`:** `formation_debug_visualizer.py` (legacy
+RViz markers), `gait_broadcaster.py` (UDP gait, must start before fleet bringup; see Known
+Issues), `start_fleet.sh`, `Cbf_params_uqp.yaml`.
+
+> **DELETED 2026-07-09 (commit 522d77b/fb5aa6c) — don't look for these:** the monolithic
+> `Formation_manager_unified_{twoOrderCBF,qp}.py`, their debug launches, `scripts/archive/`, the
+> duplicate `scripts/Cbf_params_twoOrderCBF.yaml`, `ocs2_target_publisher.py`, `apps/`. They
+> duplicated the modular package (now the single copy) or were orphaned.
 
 ## Build Commands
 
@@ -120,11 +131,15 @@ roslaunch legged_controllers fleet_bringup.launch
 # 3. Stand up + switch to trot gait
 rosrun legged_controllers start_fleet.sh
 
-# 4a. Modular upper control (preferred — also starts the debug visualizer)
+# 4a. Legacy modular Pure-Pursuit stack (also starts the debug visualizer)
 roslaunch legged_upper_control formation_hocbf.launch
 
-# 4b. OR the monolithic single-file manager
-rosrun legged_controllers Formation_manager_unified_twoOrderCBF.py
+# 4b. OR the ACTIVE ADMM system (kills C++ target + publisher + RViz rollout viz):
+#     use three_dogs_plum.launch / three_dogs_door.launch in step 1, then:
+roslaunch legged_upper_control admm_demo.launch
+#     then command ONE centroid point:
+#     rostopic pub -1 /formation/goal geometry_msgs/PoseStamped \
+#       "{header: {frame_id: 'world'}, pose: {position: {x: 9.0, y: 0.0, z: 0.5}}}"
 
 # 5a. Keyboard (publishes raw; CBF filters before cmd_vel)
 rosrun teleop_twist_keyboard teleop_twist_keyboard.py cmd_vel:=/dog1/cmd_vel_raw
@@ -136,7 +151,7 @@ rostopic pub /dog1/goal geometry_msgs/PoseStamped \
 ## Architecture Overview
 
 ```
-Python / 20 Hz      FleetManagerUQP (modular) or Formation_manager_unified_*.py (monolith)
+Python / 10 Hz      ocs2_fleet_publisher.py (ACTIVE ADMM) — or the legacy FleetManagerUQP @ 20 Hz
                     └─ L4 Formation: V-shape / Laplacian offsets, follower targets
                     └─ L3 AStarPlanner: grid path planning with inflation
                     └─ L2 PurePursuitController: waypoint tracking → (vx, vy, wz)
@@ -157,7 +172,7 @@ C++ / 1000 Hz       LeggedHWSim (Gazebo plugin): joint/IMU reads, hybrid impedan
 ## CBF Parameters
 
 - Modular: `legged_upper_control_pkg/config/Cbf_params_twoOrderCBF.yaml`
-- Monolith: `legged_controllers/scripts/Cbf_params_twoOrderCBF.yaml` (HOCBF: `cbf_gamma1`/`cbf_gamma2`, `w_accel`) and `Cbf_params_uqp.yaml` (velocity-level: `cbf_lookahead_tau`)
+- Legacy velocity-QP: `legged_controllers/scripts/Cbf_params_uqp.yaml` (`cbf_lookahead_tau`), still read by `formation_debug_visualizer.py`. (The monolith `Cbf_params_twoOrderCBF.yaml` copy was deleted; `config/Cbf_params_twoOrderCBF.yaml` is now the single copy.)
 - Common keys: `cbf_enabled`, `cbf_d_min`, `cbf_slack_enabled`/`slack_lambda`, formation `offsets`, `obstacles`/`walls` (manually tuned to match the Gazebo arena), `followers_stationary`.
 - `followers_stationary: true` is the safe default (followers hold position); set `false` for PID tracking only after the leader walks stably.
 
@@ -167,7 +182,11 @@ Each dog (dog1/dog2/dog3) is isolated through 4 layers: (1) Gazebo `robotNamespa
 
 ## Known Issues / Design Notes
 
-- **Code duplication (top structural risk):** A*, `FleetManagerUQP`, the CBF controllers, and `Cbf_params_twoOrderCBF.yaml` each exist in 3–4 near-identical copies (modular package + monolith + `archive/`). The upper-control-pkg `Cbf_params_twoOrderCBF.yaml` is a byte-identical copy of the scripts one — edit one and the other silently drifts. When changing behavior, decide which implementation is authoritative and keep the param files in sync.
+- **Code duplication (mostly resolved 2026-07-09):** the 3–4× copies of A*, `FleetManagerUQP`,
+  the CBF controllers, and `Cbf_params_twoOrderCBF.yaml` (modular + monolith + `archive/`) were
+  cut down — the monoliths and `archive/` are **deleted**; the modular package is the single
+  copy. Remaining legacy duplication risk is small. The ADMM system (`ocs2_fleet_publisher.py` +
+  `admm/`) is a separate, non-duplicated implementation and is where new work goes.
 - `gait_broadcaster.py` must run before `fleet_bringup.launch` completes or the GaitReceiver UDP port binding races; the 15s stagger in `fleet_bringup.launch` mitigates this.
 - The CBF QP uses a **single-integrator model** (velocity = input), intentionally — the low-level C++ controller handles full dynamics; CBF only needs velocity/acceleration-level safety.
 - Obstacle/wall definitions in the param YAMLs are hand-tuned to the Gazebo arena (`five_dogs.launch`); changing the arena requires updating both.
