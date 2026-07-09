@@ -11,6 +11,9 @@
 #include "legged_upper_control/admm_rti.hpp"
 #include "legged_upper_control/admm_node_qp.hpp"
 #include "legged_upper_control/admm_edge_qp.hpp"
+#include "legged_upper_control/admm_formation.hpp"
+#include "legged_upper_control/admm_motion_adapter.hpp"
+#include "legged_upper_control/admm_coordinator.hpp"
 
 namespace py = pybind11;
 
@@ -70,6 +73,20 @@ PYBIND11_MODULE(admm_core_cpp, m) {
     m.def("roundtrip", &roundtrip, "Eigen<->numpy roundtrip check");
     m.def("osqp_version", []() { return std::string(osqp_version()); },
           "Version of the linked OSQP C library (must equal osqp-python's 0.6.3)");
+    m.def("h_obstacle",
+          [](const Eigen::VectorXd& p, const Eigen::VectorXd& p_obs, double r_eff) {
+              return admm::h_obstacle(Eigen::Vector2d(p(0), p(1)),
+                                      Eigen::Vector2d(p_obs(0), p_obs(1)), r_eff);
+          },
+          py::arg("p"), py::arg("p_obs"), py::arg("r_eff"));
+    m.def("h_wall",
+          [](const Eigen::VectorXd& p, const Eigen::VectorXd& n_w,
+             const Eigen::VectorXd& p_w, double d_safe) {
+              return admm::h_wall(Eigen::Vector2d(p(0), p(1)),
+                                  Eigen::Vector2d(n_w(0), n_w(1)),
+                                  Eigen::Vector2d(p_w(0), p_w(1)), d_safe);
+          },
+          py::arg("p"), py::arg("n_w"), py::arg("p_w"), py::arg("d_safe"));
 
     // --- C1: constants (drop-in for `import constants as C` in the gate tests) ---
     auto c = m.def_submodule("constants", "C++ mirror of admm/constants.py");
@@ -274,4 +291,261 @@ PYBIND11_MODULE(admm_core_cpp, m) {
              })
         .def("_debug_q", &admm::EdgeSubproblem::debug_q, py::arg("xi_i"),
              py::arg("xi_j"), py::arg("lam_i"), py::arg("lam_j"));
+
+    // --- C4: LaplacianFormation (drop-in for core.formation.LaplacianFormation) ---
+    py::class_<admm::LaplacianFormation>(m, "LaplacianFormation")
+        .def(py::init([](const py::dict& formation_configs) {
+                 std::map<std::string, std::vector<Eigen::Vector2d>> cfg;
+                 for (const auto& kv : formation_configs) {
+                     std::vector<Eigen::Vector2d> pts;
+                     for (const auto& p : kv.second.cast<py::sequence>()) {
+                         const py::sequence s = p.cast<py::sequence>();
+                         pts.emplace_back(s[0].cast<double>(), s[1].cast<double>());
+                     }
+                     cfg[kv.first.cast<std::string>()] = pts;
+                 }
+                 return new admm::LaplacianFormation(cfg);
+             }),
+             py::arg("formation_configs"))
+        .def("set_formation", &admm::LaplacianFormation::set_formation, py::arg("name"))
+        .def_property_readonly("current_formation",
+                               [](const admm::LaplacianFormation& self) -> py::object {
+                                   if (self.current_formation().empty())
+                                       return py::none();
+                                   return py::cast(self.current_formation());
+                               })
+        .def_property_readonly("current_offsets",
+                               [](const admm::LaplacianFormation& self) -> py::object {
+                                   const auto* off = self.current_offsets();
+                                   if (off == nullptr) return py::none();
+                                   py::list out;
+                                   for (const auto& p : *off) out.append(py::cast(p));
+                                   return out;
+                               })
+        .def("compute",
+             [](const admm::LaplacianFormation& self, const py::sequence& positions) {
+                 std::vector<Eigen::Vector2d> pos;
+                 for (const auto& p : positions) {
+                     const Eigen::VectorXd v = p.cast<Eigen::VectorXd>();
+                     pos.emplace_back(v(0), v(1));
+                 }
+                 const auto r = self.compute(pos);
+                 py::list grads;
+                 for (const auto& g : r.second) grads.append(py::cast(g));
+                 return py::make_tuple(r.first, grads);
+             },
+             py::arg("positions"));
+
+    // --- C4: motion adapter (drop-in for `import motion_adapter as ma`) ---
+    auto ma = m.def_submodule("motion_adapter", "C++ mirror of admm/motion_adapter.py");
+    ma.attr("OCS2_STATE_DIM") = admm::OCS2_STATE_DIM;
+    ma.attr("MOM_LIN_X") = admm::MOM_LIN_X;
+    ma.attr("MOM_LIN_Y") = admm::MOM_LIN_Y;
+    ma.attr("MOM_LIN_Z") = admm::MOM_LIN_Z;
+    ma.attr("MOM_ANG_X") = admm::MOM_ANG_X;
+    ma.attr("MOM_ANG_Y") = admm::MOM_ANG_Y;
+    ma.attr("MOM_ANG_Z") = admm::MOM_ANG_Z;
+    ma.attr("BASE_PX") = admm::BASE_PX;
+    ma.attr("BASE_PY") = admm::BASE_PY;
+    ma.attr("BASE_Z") = admm::BASE_Z;
+    ma.attr("BASE_YAW") = admm::BASE_YAW;
+    ma.attr("BASE_PITCH") = admm::BASE_PITCH;
+    ma.attr("BASE_ROLL") = admm::BASE_ROLL;
+    ma.attr("JOINT_START") = admm::JOINT_START;
+    ma.attr("N_JOINTS") = admm::N_JOINTS;
+    ma.def("wrap_to_pi", &admm::wrap_to_pi, py::arg("angle"));
+    ma.def("pad_ocs2_state", &admm::pad_ocs2_state, py::arg("px"), py::arg("py"),
+           py::arg("vx"), py::arg("vy"), py::arg("yaw"), py::arg("com_height"),
+           py::arg("default_joints"));
+    ma.def("yaw_step", &admm::yaw_step, py::arg("vx"), py::arg("vy"),
+           py::arg("prev_yaw"), py::arg("v_freeze"), py::arg("ema_alpha"));
+    ma.def("yaw_trajectory", &admm::yaw_trajectory, py::arg("vx_arr"),
+           py::arg("vy_arr"), py::arg("seed_yaw"), py::arg("v_freeze"),
+           py::arg("ema_alpha"));
+    ma.def("yaw_trajectory_path",
+           [](const Eigen::VectorXd& px_arr, const Eigen::VectorXd& py_arr,
+              double seed_yaw, int lookahead_M, double pos_eps, double ema_alpha,
+              const py::object& max_dyaw) {
+               return admm::yaw_trajectory_path(
+                   px_arr, py_arr, seed_yaw, lookahead_M, pos_eps, ema_alpha,
+                   !max_dyaw.is_none(),
+                   max_dyaw.is_none() ? 0.0 : max_dyaw.cast<double>());
+           },
+           py::arg("px_arr"), py::arg("py_arr"), py::arg("seed_yaw"),
+           py::arg("lookahead_M"), py::arg("pos_eps"), py::arg("ema_alpha"),
+           py::arg("max_dyaw") = py::none());
+    ma.def("safe_prefix_length",
+           [](const Eigen::VectorXd& px_i, const Eigen::VectorXd& py_i,
+              const py::sequence& others_pos, double d_safe, int k_max) {
+               std::vector<std::pair<Eigen::VectorXd, Eigen::VectorXd>> others;
+               for (const auto& o : others_pos) {
+                   const py::sequence pair = o.cast<py::sequence>();
+                   others.emplace_back(pair[0].cast<Eigen::VectorXd>(),
+                                       pair[1].cast<Eigen::VectorXd>());
+               }
+               return admm::safe_prefix_length(px_i, py_i, others, d_safe, k_max);
+           },
+           py::arg("px_i"), py::arg("py_i"), py::arg("others_pos"), py::arg("d_safe"),
+           py::arg("k_max"));
+
+    auto target_to_py = [](const admm::MotionAdapter::Target& t) {
+        py::dict d;
+        d["times"] = t.times;
+        d["states"] = t.states;
+        d["inputs"] = t.inputs;
+        d["next_seed"] = t.next_seed;
+        return d;
+    };
+    py::class_<admm::MotionAdapter>(ma, "MotionAdapter")
+        .def(py::init([](double com_height, const Eigen::VectorXd& default_joints,
+                         const py::object& n, const py::object& ts, double v_freeze,
+                         double ema_alpha, int input_dim, const std::string& yaw_mode,
+                         int lookahead_M, double pos_eps, const py::object& k_send,
+                         const py::object& max_yaw_rate) {
+                 return new admm::MotionAdapter(
+                     com_height, default_joints, resolve_n(n),
+                     ts.is_none() ? admm::TS : ts.cast<double>(), v_freeze, ema_alpha,
+                     input_dim, yaw_mode, lookahead_M, pos_eps,
+                     k_send.is_none() ? admm::K_SEND : k_send.cast<int>(),
+                     !max_yaw_rate.is_none(),
+                     max_yaw_rate.is_none() ? 0.0 : max_yaw_rate.cast<double>());
+             }),
+             py::arg("com_height"), py::arg("default_joints"), py::arg("n") = py::none(),
+             py::arg("ts") = py::none(), py::arg("v_freeze") = 0.05,
+             py::arg("ema_alpha") = 0.3, py::arg("input_dim") = 24,
+             py::arg("yaw_mode") = "path", py::arg("lookahead_M") = 5,
+             py::arg("pos_eps") = 0.02, py::arg("k_send") = py::none(),
+             py::arg("max_yaw_rate") = py::none())
+        .def_readonly("N", &admm::MotionAdapter::N_)
+        .def_readonly("k_send", &admm::MotionAdapter::k_send_)
+        .def_property_readonly("yaw_mode", &admm::MotionAdapter::yaw_mode)
+        .def_property_readonly("ts", &admm::MotionAdapter::ts)
+        .def_property_readonly("v_freeze", &admm::MotionAdapter::v_freeze)
+        .def_property_readonly("ema_alpha", &admm::MotionAdapter::ema_alpha)
+        .def_property_readonly("lookahead_M", &admm::MotionAdapter::lookahead_M)
+        .def_property_readonly("pos_eps", &admm::MotionAdapter::pos_eps)
+        .def("build_target",
+             [target_to_py](const admm::MotionAdapter& self, const Eigen::VectorXd& xi,
+                            double t0, double seed_yaw, const py::object& yaw_mode,
+                            const py::object& k_send) {
+                 return target_to_py(self.build_target(
+                     xi, t0, seed_yaw,
+                     yaw_mode.is_none() ? std::string() : yaw_mode.cast<std::string>(),
+                     k_send.is_none() ? -1 : k_send.cast<int>()));
+             },
+             py::arg("xi"), py::arg("t0") = 0.0, py::arg("seed_yaw") = 0.0,
+             py::arg("yaw_mode") = py::none(), py::arg("k_send") = py::none())
+        .def("adapt",
+             [target_to_py](admm::MotionAdapter& self, const Eigen::VectorXd& xi,
+                            int dog, double t0) {
+                 return target_to_py(self.adapt(xi, dog, t0));
+             },
+             py::arg("xi"), py::arg("dog"), py::arg("t0") = 0.0);
+
+    // --- C4: coordinator (drop-in for `import admm_coordinator as ac`) ---
+    auto ac = m.def_submodule("coordinator", "C++ mirror of admm/admm_coordinator.py");
+    ac.def("consensus_target",
+           [](const py::dict& z, const py::dict& lam, int i, const py::sequence& nbrs) {
+               admm::EdgeVecs zc, lc;
+               auto load = [](const py::dict& src, admm::EdgeVecs& dst) {
+                   for (const auto& kv : src) {
+                       const py::tuple e = kv.first.cast<py::tuple>();
+                       const admm::EdgeKey key(e[0].cast<int>(), e[1].cast<int>());
+                       for (const auto& kv2 : kv.second.cast<py::dict>())
+                           dst[key][kv2.first.cast<int>()] =
+                               kv2.second.cast<Eigen::VectorXd>();
+                   }
+               };
+               load(z, zc);
+               load(lam, lc);
+               std::vector<int> nb;
+               for (const auto& j : nbrs) nb.push_back(j.cast<int>());
+               return admm::consensus_target(zc, lc, i, nb);
+           },
+           py::arg("z"), py::arg("lam"), py::arg("i"), py::arg("neighbors"));
+    py::class_<admm::ADMMCoordinator>(ac, "ADMMCoordinator")
+        .def(py::init([](const py::object& p_iters, const py::object& rho,
+                         const py::sequence& dogs, const py::sequence& edges,
+                         const py::object& formation, double w_form,
+                         const py::object& obstacles, const py::object& walls,
+                         int hard_through) {
+                 std::vector<int> dg;
+                 for (const auto& d : dogs) dg.push_back(d.cast<int>());
+                 std::vector<admm::EdgeKey> eg;
+                 for (const auto& e : edges) {
+                     const py::sequence s = e.cast<py::sequence>();
+                     eg.emplace_back(s[0].cast<int>(), s[1].cast<int>());
+                 }
+                 const admm::LaplacianFormation* form =
+                     formation.is_none()
+                         ? nullptr
+                         : formation.cast<const admm::LaplacianFormation*>();
+                 return new admm::ADMMCoordinator(
+                     p_iters.is_none() ? admm::P_ITERS : p_iters.cast<int>(),
+                     rho.is_none() ? admm::RHO : rho.cast<double>(), dg, eg, form,
+                     w_form, parse_obstacles(obstacles), parse_walls(walls),
+                     hard_through);
+             }),
+             py::arg("p_iters") = py::none(), py::arg("rho") = py::none(),
+             py::arg("dogs") = py::make_tuple(1, 2),
+             py::arg("edges") = py::make_tuple(py::make_tuple(1, 2)),
+             py::arg("formation") = py::none(), py::arg("w_form") = 0.0,
+             py::arg("obstacles") = py::none(), py::arg("walls") = py::none(),
+             py::arg("hard_through") = 1,
+             py::keep_alive<1, 6>())  // coordinator keeps the formation alive
+        .def_readonly("N", &admm::ADMMCoordinator::N_)
+        .def_readonly("cycle", &admm::ADMMCoordinator::cycle_)
+        .def_property_readonly("neighbors",
+                               [](const admm::ADMMCoordinator& self) {
+                                   py::dict d;
+                                   for (const auto& kv : self.neighbors())
+                                       d[py::cast(kv.first)] = kv.second;
+                                   return d;
+                               })
+        .def_property_readonly("prev_z",
+                               [](const admm::ADMMCoordinator& self) -> py::object {
+                                   if (!self.has_prev()) return py::none();
+                                   py::dict d;
+                                   for (const auto& kv : self.prev_z()) {
+                                       py::dict inner;
+                                       for (const auto& kv2 : kv.second)
+                                           inner[py::cast(kv2.first)] = kv2.second;
+                                       d[py::make_tuple(kv.first.first,
+                                                        kv.first.second)] = inner;
+                                   }
+                                   return d;
+                               })
+        .def_property_readonly("prev_lam",
+                               [](const admm::ADMMCoordinator& self) -> py::object {
+                                   if (!self.has_prev()) return py::none();
+                                   py::dict d;
+                                   for (const auto& kv : self.prev_lam()) {
+                                       py::dict inner;
+                                       for (const auto& kv2 : kv.second)
+                                           inner[py::cast(kv2.first)] = kv2.second;
+                                       d[py::make_tuple(kv.first.first,
+                                                        kv.first.second)] = inner;
+                                   }
+                                   return d;
+                               })
+        .def("step",
+             [](admm::ADMMCoordinator& self, const py::dict& xnow,
+                const py::dict& xdes) {
+                 std::map<int, Eigen::VectorXd> xn;
+                 std::map<int, Eigen::MatrixXd> xd;
+                 for (const auto& kv : xnow)
+                     xn[kv.first.cast<int>()] = kv.second.cast<Eigen::VectorXd>();
+                 for (const auto& kv : xdes)
+                     xd[kv.first.cast<int>()] = kv.second.cast<Eigen::MatrixXd>();
+                 const auto r = self.step(xn, xd);
+                 py::dict xi;
+                 for (const auto& kv : r.first) xi[py::cast(kv.first)] = kv.second;
+                 py::dict hist;
+                 hist["r_prim"] = r.second.r_prim;
+                 hist["r_dual"] = r.second.r_dual;
+                 hist["h2_viol"] = r.second.h2_viol;
+                 hist["edge_fail"] = r.second.edge_fail;
+                 return py::make_tuple(xi, hist);
+             },
+             py::arg("xnow"), py::arg("xdes"));
 }

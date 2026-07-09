@@ -27,6 +27,9 @@ if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
     src/admm_core/rti.cpp
     src/admm_core/node_qp.cpp
     src/admm_core/edge_qp.cpp
+    src/admm_core/formation.cpp
+    src/admm_core/motion_adapter.cpp
+    src/admm_core/coordinator.cpp
   )
   target_compile_features(admm_core PUBLIC cxx_std_17)
   target_include_directories(admm_core PUBLIC include)

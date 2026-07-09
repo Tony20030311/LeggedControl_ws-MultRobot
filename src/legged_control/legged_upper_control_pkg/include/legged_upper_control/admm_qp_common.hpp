@@ -40,6 +40,12 @@ void scatter_values(const CscPattern& pat, const std::vector<double>& trip_vals,
 
 void clip_bounds(std::vector<double>& l, std::vector<double>& u);
 
+// numpy's pairwise summation (add.reduce), mirrored exactly: sequential below 8
+// elements, 8 partial accumulators + tree combine up to 128, recursive halving
+// above. np.sum(arr) on >8 elements is NOT sequential — a sequential C++ sum
+// diverges from the golden reference in the last bits.
+double numpy_pairwise_sum(const double* a, std::size_t n);
+
 // One OSQP problem, osqp-python-equivalent lifecycle: setup once with a fixed
 // sparsity pattern, then values-only updates + warm-started solves.
 class OsqpProblem {

@@ -24,9 +24,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import constants as C                 # noqa: E402
-import node_subproblem as nq          # noqa: E402
-import motion_adapter as ma           # noqa: E402
+from admm_impl import constants as C  # noqa: E402
+from admm_impl import nq  # noqa: E402
+from admm_impl import ma  # noqa: E402
 from reference import build_reference  # noqa: E402
 
 PNG = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress",
@@ -91,15 +91,18 @@ def run():
     raw = np.array([math.atan2(vy[k], vx[k]) if math.hypot(vx[k], vy[k]) > adap.v_freeze
                     else np.nan for k in range(len(vx))])
 
-    # integration check on a real horizon ξ (mirror of the unit asserts)
+    # integration check on a real horizon ξ (mirror of the unit asserts).
+    # build_target sends only the first k_send (=C.K_SEND) steps — the safe near
+    # horizon; the unsafe far tail is dropped (dynamic safe-prefix design).
     out = adap.build_target(last_xi, t0=0.0, seed_yaw=float(yaw[-1]))
     N = adap.N
+    ns = adap.k_send
     checks = {
-        "states_shape": out["states"].shape == (N, ma.OCS2_STATE_DIM),
+        "states_shape": out["states"].shape == (ns, ma.OCS2_STATE_DIM),
         "times_monotonic": bool(np.all(np.diff(out["times"]) > 0)),
         "inputs_zero": bool(np.all(out["inputs"] == 0.0)),
         "px_at_idx6": bool(np.allclose(out["states"][:, 6],
-                                       [last_xi[C.px_index(k, N)] for k in range(1, N + 1)])),
+                                       [last_xi[C.px_index(k, N)] for k in range(1, ns + 1)])),
         "z_forced_comheight": bool(np.allclose(out["states"][:, 8], COM_HEIGHT)),
         "angmom_zero(idx3-5)": bool(np.all(out["states"][:, 3:6] == 0.0)),
         "pitch_roll_zero": bool(np.all(out["states"][:, 10:12] == 0.0)),

@@ -16,8 +16,8 @@ import math
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import constants as C          # noqa: E402
-import motion_adapter as ma    # noqa: E402
+from admm_impl import constants as C  # noqa: E402
+from admm_impl import ma  # noqa: E402
 
 DEFJ = np.arange(1.0, 13.0)    # distinct 12-vector -> any mis-placement shows
 

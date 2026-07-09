@@ -15,9 +15,9 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import constants as C          # noqa: E402
+from admm_impl import constants as C  # noqa: E402
 import reference as ref        # noqa: E402
-import admm_coordinator as ac  # noqa: E402
+from admm_impl import ac  # noqa: E402
 
 
 def _two_dog_setup():

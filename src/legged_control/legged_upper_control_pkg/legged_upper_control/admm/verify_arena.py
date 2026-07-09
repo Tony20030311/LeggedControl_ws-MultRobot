@@ -39,11 +39,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))                 # legged_upper_control/ -> core.formation
 sys.path.insert(0, HERE)                                   # admm/ -> constants, coordinator, ...
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "scripts"))  # publisher
-import constants as C                                       # noqa: E402
-import admm_coordinator as ac                               # noqa: E402
-import node_subproblem as nq                                # noqa: E402
+from admm_impl import constants as C  # noqa: E402
+from admm_impl import ac  # noqa: E402
+from admm_impl import nq  # noqa: E402
 from reference import build_reference                       # noqa: E402
-from core.formation import LaplacianFormation               # noqa: E402
+from admm_impl import LaplacianFormation  # noqa: E402
 # single source of truth for the arena (obstacles + goals) + formation shapes:
 from ocs2_fleet_publisher import ARENAS, FORMATIONS         # noqa: E402
 

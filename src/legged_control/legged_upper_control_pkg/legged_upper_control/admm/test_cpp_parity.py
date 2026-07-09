@@ -15,10 +15,17 @@ import constants as PY  # noqa: E402
 import rti_linearizer as PY_RTI  # noqa: E402
 import node_subproblem as PY_NQ  # noqa: E402
 import edge_subproblem as PY_EQ  # noqa: E402
+import admm_coordinator as PY_AC  # noqa: E402
+import motion_adapter as PY_MA  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.formation import LaplacianFormation as PyFormation  # noqa: E402
 
 import admm_core_cpp  # noqa: E402
 from admm_core_cpp import constants as CPP  # noqa: E402
 from admm_core_cpp import rti as CPP_RTI  # noqa: E402
+from admm_core_cpp import motion_adapter as CPP_MA  # noqa: E402
+from admm_core_cpp import coordinator as CPP_AC  # noqa: E402
 
 _SCALARS = [
     "N", "TS", "GAMMA1", "GAMMA2", "N_X", "N_U", "XI_DIM",
@@ -243,6 +250,114 @@ def test_c3_edge_solve_bit_identical():
                     for a, b, name in zip(zp, zc, ("z_i", "z_j", "s")):
                         assert np.array_equal(a, b), \
                             f"{name} differs n={n} cycle={cycle} iter={it}"
+
+
+# ---------------- C4: formation / motion adapter / coordinator ----------------
+
+_FORMATIONS = {"V": [[0.67, 0.0], [-0.33, 1.0], [-0.33, -1.0]],
+               "line": [[1.2, 0.0], [0.0, 0.0], [-1.2, 0.0]]}
+
+
+def test_c4_formation_bit_identical():
+    rng = np.random.default_rng(41)
+    py_f = PyFormation({k: [np.array(p) for p in v] for k, v in _FORMATIONS.items()})
+    cpp_f = admm_core_cpp.LaplacianFormation(_FORMATIONS)
+    for name in ("V", "line"):
+        py_f.set_formation(name)
+        cpp_f.set_formation(name)
+        assert py_f.current_formation == cpp_f.current_formation
+        for _ in range(300):
+            pos = [rng.uniform(-3.0, 3.0, 2) for _ in range(3)]
+            fp, gp = py_f.compute(pos)
+            fc, gc = cpp_f.compute(pos)
+            assert _bits_equal([fp], [fc]), f"f differs ({name})"
+            for a, b in zip(gp, gc):
+                assert _bits_equal(a, b), f"grad differs ({name})"
+
+
+def test_c4_motion_adapter_bit_identical():
+    rng = np.random.default_rng(43)
+    joints = rng.uniform(-1.0, 1.0, 12)
+    kwargs = dict(com_height=0.3, default_joints=joints, max_yaw_rate=1.2)
+    py_m = PY_MA.MotionAdapter(**kwargs)
+    cpp_m = CPP_MA.MotionAdapter(**kwargs)
+    for a in rng.uniform(-20.0, 20.0, 500):  # wrap_to_pi randomized
+        assert PY_MA.wrap_to_pi(a) == CPP_MA.wrap_to_pi(a), f"wrap_to_pi({a})"
+    for cyc in range(6):  # stateful adapt() chain, both dogs
+        xi = rng.uniform(-3.0, 3.0, PY.xi_dim(PY.N))
+        for dog in (1, 2):
+            tp = py_m.adapt(xi, dog, t0=0.7 * cyc)
+            tc = cpp_m.adapt(xi, dog, t0=0.7 * cyc)
+            for key in ("times", "states", "inputs"):
+                assert _bits_equal(np.asarray(tp[key]), np.asarray(tc[key])), \
+                    f"{key} differs cyc={cyc} dog={dog}"
+            assert tp["next_seed"] == tc["next_seed"]
+    # tangent mode + explicit k_send override
+    xi = rng.uniform(-3.0, 3.0, PY.xi_dim(PY.N))
+    tp = py_m.build_target(xi, seed_yaw=0.3, yaw_mode="tangent", k_send=7)
+    tc = cpp_m.build_target(xi, seed_yaw=0.3, yaw_mode="tangent", k_send=7)
+    for key in ("times", "states", "inputs"):
+        assert _bits_equal(np.asarray(tp[key]), np.asarray(tc[key])), key
+    # safe_prefix_length randomized
+    for _ in range(200):
+        n = 10
+        px_i, py_i = rng.uniform(-2, 2, n), rng.uniform(-2, 2, n)
+        others = [(rng.uniform(-2, 2, n), rng.uniform(-2, 2, n)) for _ in range(2)]
+        assert (PY_MA.safe_prefix_length(px_i, py_i, others, 0.6, 10)
+                == CPP_MA.safe_prefix_length(px_i, py_i, others, 0.6, 10))
+
+
+def _coordinator_pair(dogs, edges, with_formation):
+    obstacles = [{"pos": (2.0, 0.2), "radius": 0.30}]
+    walls = [{"normal": (0.0, 1.0), "point": (0.0, -2.0), "d_safe": 0.4}]
+    py_f = cpp_f = None
+    if with_formation:
+        py_f = PyFormation({k: [np.array(p) for p in v] for k, v in _FORMATIONS.items()})
+        py_f.set_formation("V")
+        cpp_f = admm_core_cpp.LaplacianFormation(_FORMATIONS)
+        cpp_f.set_formation("V")
+    py_c = PY_AC.ADMMCoordinator(dogs=dogs, edges=edges, formation=py_f,
+                                 w_form=1.0 if with_formation else 0.0,
+                                 obstacles=obstacles, walls=walls, hard_through=1)
+    cpp_c = CPP_AC.ADMMCoordinator(dogs=dogs, edges=edges, formation=cpp_f,
+                                   w_form=1.0 if with_formation else 0.0,
+                                   obstacles=obstacles, walls=walls, hard_through=1)
+    return py_c, cpp_c
+
+
+def _coordinator_chain(dogs, edges, with_formation, cycles=3):
+    rng = np.random.default_rng(47)
+    py_c, cpp_c = _coordinator_pair(dogs, edges, with_formation)
+    N = PY.N
+    starts = {d: np.array([0.0, 1.0 * i, 0.0, 0.0])
+              for i, d in enumerate(dogs)}
+    for cyc in range(cycles):
+        xnow = {d: starts[d] + np.concatenate([rng.uniform(-0.05, 0.05, 2), [0, 0]])
+                for d in dogs}
+        xdes = {}
+        for i, d in enumerate(dogs):
+            xd = np.zeros((N, 4))
+            xd[:, 0] = np.linspace(0.2, 4.0, N)
+            xd[:, 1] = 1.0 * i
+            xdes[d] = xd
+        xp, hp = py_c.step(xnow, xdes)
+        xc, hc = cpp_c.step(xnow, xdes)
+        for d in dogs:
+            assert _bits_equal(xp[d], xc[d]), \
+                f"xi differs dog={d} cycle={cyc} (formation={with_formation})"
+        for key in ("r_prim", "r_dual", "h2_viol"):
+            assert _bits_equal(np.asarray(hp[key]), np.asarray(hc[key])), \
+                f"hist {key} differs cycle={cyc}"
+        assert hp["edge_fail"] == hc["edge_fail"]
+
+
+def test_c4_coordinator_two_dogs_bit_identical():
+    _coordinator_chain(dogs=(1, 2), edges=((1, 2),), with_formation=False)
+
+
+def test_c4_coordinator_three_dogs_formation_bit_identical():
+    _coordinator_chain(dogs=(1, 2, 3), edges=((1, 2), (1, 3), (2, 3)),
+                       with_formation=True)
 
 
 if __name__ == "__main__":

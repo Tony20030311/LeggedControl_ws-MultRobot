@@ -47,6 +47,34 @@ void clip_bounds(std::vector<double>& l, std::vector<double>& u) {
     for (double& v : u) v = std::min(v, OSQP_INFTY);
 }
 
+double numpy_pairwise_sum(const double* a, std::size_t n) {
+    if (n < 8) {
+        double res = 0.0;
+        for (std::size_t i = 0; i < n; ++i) res += a[i];
+        return res;
+    }
+    if (n <= 128) {
+        double r[8] = {a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]};
+        std::size_t i = 8;
+        for (; i < n - (n % 8); i += 8) {
+            r[0] += a[i];
+            r[1] += a[i + 1];
+            r[2] += a[i + 2];
+            r[3] += a[i + 3];
+            r[4] += a[i + 4];
+            r[5] += a[i + 5];
+            r[6] += a[i + 6];
+            r[7] += a[i + 7];
+        }
+        double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        for (; i < n; ++i) res += a[i];
+        return res;
+    }
+    std::size_t n2 = n / 2;
+    n2 -= n2 % 8;
+    return numpy_pairwise_sum(a, n2) + numpy_pairwise_sum(a + n2, n - n2);
+}
+
 OsqpProblem::~OsqpProblem() {
     if (work_) osqp_cleanup(work_);
 }

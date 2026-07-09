@@ -35,10 +35,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import constants as C            # noqa: E402
-import admm_coordinator as ac    # noqa: E402
+from admm_impl import constants as C  # noqa: E402
+from admm_impl import ac  # noqa: E402
 import reference as ref          # noqa: E402
-import motion_adapter as ma      # noqa: E402
+from admm_impl import ma  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PNG = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress",

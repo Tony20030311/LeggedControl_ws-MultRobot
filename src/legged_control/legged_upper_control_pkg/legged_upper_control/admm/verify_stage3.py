@@ -48,11 +48,11 @@ import matplotlib.pyplot as plt  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))   # legged_upper_control/ -> core.formation
 sys.path.insert(0, HERE)                     # admm/ -> constants, coordinator, ...
-import constants as C                         # noqa: E402
-import admm_coordinator as ac                 # noqa: E402
-import node_subproblem as nq                  # noqa: E402
+from admm_impl import constants as C  # noqa: E402
+from admm_impl import ac  # noqa: E402
+from admm_impl import nq  # noqa: E402
 from reference import build_reference         # noqa: E402
-from core.formation import LaplacianFormation  # noqa: E402
+from admm_impl import LaplacianFormation  # noqa: E402
 
 PNG_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "progress"))
 DOGS = (1, 2, 3)
