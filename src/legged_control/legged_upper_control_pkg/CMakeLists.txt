@@ -22,6 +22,7 @@ if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
   pybind11_add_module(admm_core_cpp
     src/admm_core/bindings.cpp
   )
+  target_compile_features(admm_core_cpp PRIVATE cxx_std_17)
   target_include_directories(admm_core_cpp PRIVATE include)
   target_link_libraries(admm_core_cpp PRIVATE osqp::osqp Eigen3::Eigen)
   set_target_properties(admm_core_cpp PROPERTIES
