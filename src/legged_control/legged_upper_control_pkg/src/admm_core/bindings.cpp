@@ -575,6 +575,17 @@ PYBIND11_MODULE(admm_core_cpp, m) {
                                        d[py::cast(kv.first)] = kv.second;
                                    return d;
                                })
+        .def_property_readonly("obstacles",
+                               [](const admm::ADMMCoordinator& self) {
+                                   py::list obs;  // mirrors Python self.obstacles
+                                   for (const auto& o : self.obstacles()) {
+                                       py::dict od;
+                                       od["pos"] = py::make_tuple(o.pos(0), o.pos(1));
+                                       od["radius"] = o.radius;
+                                       obs.append(od);
+                                   }
+                                   return obs;
+                               })
         .def_property_readonly("prev_z",
                                [](const admm::ADMMCoordinator& self) -> py::object {
                                    if (!self.has_prev()) return py::none();

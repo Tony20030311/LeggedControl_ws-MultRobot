@@ -37,7 +37,8 @@ ADMMCoordinator::ADMMCoordinator(int p_iters, double rho, std::vector<int> dogs,
       dogs_(std::move(dogs)),
       edges_(std::move(edges)),
       formation_(formation),
-      w_form_(w_form) {
+      w_form_(w_form),
+      obstacles_(obstacles) {
     for (const int i : dogs_) {
         std::vector<int> nb;
         for (const EdgeKey& e : edges_)

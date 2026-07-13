@@ -3,10 +3,13 @@ project(legged_upper_control)
 
 find_package(catkin REQUIRED COMPONENTS
   rospy
+  roscpp
+  roslib
   std_msgs
   geometry_msgs
   nav_msgs
   visualization_msgs
+  ocs2_msgs
 )
 
 catkin_python_setup()
@@ -51,6 +54,15 @@ if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
     LIBRARY_OUTPUT_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_PYTHON_DESTINATION})
   install(TARGETS admm_core_cpp
     LIBRARY DESTINATION ${CATKIN_GLOBAL_PYTHON_DESTINATION})
+
+  # ── roscpp mirror of scripts/ocs2_fleet_publisher.py (C6f) ──
+  # links admm_core directly (no pybind); needs roscpp + ocs2_msgs from catkin.
+  add_executable(ocs2_fleet_publisher_node src/ocs2_fleet_publisher_node.cpp)
+  target_include_directories(ocs2_fleet_publisher_node PRIVATE include ${catkin_INCLUDE_DIRS})
+  target_link_libraries(ocs2_fleet_publisher_node admm_core ${catkin_LIBRARIES})
+  add_dependencies(ocs2_fleet_publisher_node ${catkin_EXPORTED_TARGETS})
+  install(TARGETS ocs2_fleet_publisher_node
+    RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 else()
   message(WARNING "legged_upper_control: pybind11/OSQP/Eigen3 not found — "
                   "skipping admm_core_cpp (run tools/setup_admm_cpp_env.sh in the container)")

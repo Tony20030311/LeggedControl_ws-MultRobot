@@ -286,6 +286,19 @@ class FleetPublisher:
             rospy.logwarn("[fleet_pub] cannot open log %s: %s", self._csv_path, e)
             self._csv = None
 
+        # optional ADMM per-iter residual log (真身/分身: primal+dual residual each ADMM
+        # iteration, per control cycle) -- diagnostic, off unless ~log_hist_csv is set.
+        self._hist_csv = None
+        _hpath = rospy.get_param("~log_hist_csv", "")
+        if _hpath:
+            try:
+                self._hist_csv = open(_hpath, "w")
+                self._hist_csv.write("# ADMM residuals; row = t, r_prim[0..P-1], r_dual[0..P-1]\n")
+                rospy.on_shutdown(lambda: self._hist_csv and self._hist_csv.close())
+            except IOError as e:
+                rospy.logwarn("[fleet_pub] cannot open hist log %s: %s", _hpath, e)
+                self._hist_csv = None
+
         rospy.Timer(rospy.Duration(self.ts), self._tick)
         rospy.loginfo("[fleet_pub] dogs=%s formation=%s w_form=%.1f v=%.2f arena=%r "
                       "obstacles=%s goals=%s", self.dogs, self.formation_name,
@@ -439,6 +452,13 @@ class FleetPublisher:
         except Exception as e:                       # ponytail: one QP hiccup shouldn't kill the node
             rospy.logwarn_throttle(2.0, "[fleet_pub] coord.step failed: %s", e)
             return
+
+        if self._hist_csv is not None and not self._hist_csv.closed:
+            _rp = list(_hist.get("r_prim", [])); _rd = list(_hist.get("r_dual", []))
+            self._hist_csv.write("%.4f," % self.obs[self.dogs[0]].time
+                                 + ",".join("%.6g" % v for v in _rp) + ","
+                                 + ",".join("%.6g" % v for v in _rd) + "\n")
+            self._hist_csv.flush()
 
         # NaN guard (the door-arena fall root cause): OSQP returns a non-finite xi when the
         # node/edge QP goes infeasible (e.g. a dog squeezed between an obstacle-CBF and the

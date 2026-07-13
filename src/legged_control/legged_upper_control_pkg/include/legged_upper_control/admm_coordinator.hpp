@@ -56,6 +56,9 @@ public:
     const EdgeVecs& prev_z() const { return prev_z_; }
     const EdgeVecs& prev_lam() const { return prev_lam_; }
     const std::map<int, std::vector<int>>& neighbors() const { return neighbors_; }
+    // Raw obstacle list (mirrors Python self.obstacles): the publisher reads this to
+    // build its A* planner. Stored here so the C++ coordinator is a drop-in.
+    const std::vector<Obstacle>& obstacles() const { return obstacles_; }
 
 private:
     std::map<int, Eigen::VectorXd> uncoupled_(
@@ -74,6 +77,7 @@ private:
     std::vector<EdgeKey> edges_;
     const LaplacianFormation* formation_;
     double w_form_;
+    std::vector<Obstacle> obstacles_;
     std::map<int, std::vector<int>> neighbors_;
     std::map<int, std::unique_ptr<NodeSubproblem>> node_;
     std::map<EdgeKey, std::unique_ptr<EdgeSubproblem>> edge_;

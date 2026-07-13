@@ -1,0 +1,458 @@
+// ocs2_fleet_publisher_node.cpp — roscpp mirror of scripts/ocs2_fleet_publisher.py
+// (FleetPublisher). Links admm_core directly (no pybind). Behaviour-equivalent, not
+// bit-identical: verified by scratchpad/arena/smoke_fleet_node.py (same gate the rospy
+// shell passes) and the C6g Gazebo campaign. See legged_upper_control_pkg/CLAUDE.md.
+#include <ros/ros.h>
+#include <ros/package.h>
+#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/Point.h>
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <ocs2_msgs/mpc_observation.h>
+#include <ocs2_msgs/mpc_target_trajectories.h>
+#include <ocs2_msgs/mpc_state.h>
+#include <ocs2_msgs/mpc_input.h>
+
+#include <Eigen/Dense>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "legged_upper_control/admm_constants.hpp"
+#include "legged_upper_control/admm_reference.hpp"
+#include "legged_upper_control/admm_motion_adapter.hpp"
+#include "legged_upper_control/admm_formation.hpp"
+#include "legged_upper_control/astar_planner.hpp"
+#include "legged_upper_control/fleet_config.hpp"
+#include "legged_upper_control/admm_coordinator.hpp"
+#include "legged_upper_control/admm_node_qp.hpp"  // Obstacle, Wall
+
+// OSQP's osqp.h (pulled in via admm_qp_common.hpp) re-#defines RHO as a macro after
+// admm_constants.hpp #undef'd it; undo it here so admm::RHO resolves in this TU.
+#ifdef RHO
+#undef RHO
+#endif
+
+using admm::BASE_PX; using admm::BASE_PY; using admm::BASE_YAW;
+using admm::MOM_LIN_X; using admm::MOM_LIN_Y;
+
+namespace {
+Eigen::VectorXd a1_default_joints() {
+  Eigen::VectorXd j(12);
+  j << 0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5;
+  return j;
+}
+Eigen::MatrixX2d to_mat(const std::vector<Eigen::Vector2d>& v) {
+  Eigen::MatrixX2d m(static_cast<int>(v.size()), 2);
+  for (int k = 0; k < static_cast<int>(v.size()); ++k) { m(k, 0) = v[k][0]; m(k, 1) = v[k][1]; }
+  return m;
+}
+double clip(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
+}  // namespace
+
+class FleetPublisherNode {
+ public:
+  FleetPublisherNode() : pnh_("~") {
+    dogs_ = {1, 2, 3};
+    edges_ = {{1, 2}, {1, 3}, {2, 3}};
+    N_ = admm::N; ts_ = admm::TS;
+    pnh_.param("v", v_, 0.15);
+    pnh_.param("com_height", com_height_, 0.30);
+    pnh_.param<std::string>("formation", formation_name_, "V");
+    pnh_.param("w_form", w_form_, 10.0);
+    pnh_.param<std::string>("arena", arena_name_, "");
+
+    // arena selection: "" (or unknown) -> empty world (no obstacles, DEFAULT_GOALS)
+    const auto& arenas = admm::arenas();
+    auto ait = arenas.find(arena_name_);
+    std::vector<admm::Obstacle> arena_obs;
+    std::vector<admm::Wall> arena_walls;
+    std::map<int, Eigen::Vector2d> arena_goals = admm::default_goals();
+    if (ait != arenas.end()) {
+      arena_obs = ait->second.obstacles;
+      arena_walls = ait->second.walls;
+      arena_rects_ = ait->second.rects;
+      arena_goals = ait->second.goals;
+    }
+    for (int i : dogs_) {
+      double gx, gy;
+      pnh_.param("goal" + std::to_string(i) + "_x", gx, arena_goals[i][0]);
+      pnh_.param("goal" + std::to_string(i) + "_y", gy, arena_goals[i][1]);
+      goal_[i] = Eigen::Vector2d(gx, gy);
+    }
+
+    formation_.reset(new admm::LaplacianFormation(admm::formations()));
+    formation_->set_formation(formation_name_);
+    coord_.reset(new admm::ADMMCoordinator(admm::P_ITERS, admm::RHO, dogs_, edges_,
+                                           formation_.get(), w_form_, arena_obs, arena_walls,
+                                           /*hard_through=*/1, /*parallel=*/false));
+    int lookahead; double pos_eps, yaw_rate_max;
+    pnh_.param("lookahead_m", lookahead, 5);
+    pnh_.param("pos_eps", pos_eps, 0.02);
+    pnh_.param("yaw_rate_max", yaw_rate_max, 1.2);
+    adapter_.reset(new admm::MotionAdapter(com_height_, a1_default_joints(), N_, ts_,
+                                           /*v_freeze=*/0.05, /*ema_alpha=*/0.2, /*input_dim=*/24,
+                                           /*yaw_mode=*/"path", lookahead, pos_eps,
+                                           /*k_send=*/admm::K_SEND, /*has_max_yaw_rate=*/true,
+                                           yaw_rate_max));
+
+    pnh_.param("yaw_latch_r", r_latch_, 0.25);
+    pnh_.param("yaw_latch_margin", latch_margin_, 0.10);
+    int k_send_p; double send_margin;
+    pnh_.param("k_send", k_send_p, admm::K_SEND);
+    pnh_.param("send_margin", send_margin, 0.0);
+    send_cap_ = k_send_p; d_safe_ = admm::D_MIN + send_margin;
+
+    pnh_.param("use_astar", use_astar_, false);
+    if (use_astar_ && !coord_->obstacles().empty()) {
+      double r_astar, res, x_min, x_max, y_min, y_max;
+      pnh_.param("astar_robot_radius", r_astar, 0.35);
+      pnh_.param("astar_res", res, 0.15);
+      pnh_.param("astar_x_min", x_min, 0.0);
+      pnh_.param("astar_x_max", x_max, 10.0);
+      pnh_.param("astar_y_min", y_min, -5.0);
+      pnh_.param("astar_y_max", y_max, 5.0);
+      std::vector<admm::AStarCircle> circles;
+      for (const auto& o : coord_->obstacles())
+        circles.push_back({o.pos[0], o.pos[1], o.radius});
+      std::vector<admm::AStarRect> rects;
+      for (const auto& r : arena_rects_)
+        rects.push_back({r.center[0], r.center[1], r.size[0], r.size[1], r_astar});
+      planner_.reset(new admm::AStarPlanner(res, r_astar, circles, x_min, x_max, y_min, y_max,
+                                            /*boundary_margin=*/0.45, rects));
+    }
+
+    for (int i : dogs_) {
+      std::string ns = "dog" + std::to_string(i);
+      pub_[i] = nh_.advertise<ocs2_msgs::mpc_target_trajectories>(
+          "/" + ns + "/" + ns + "_mpc_target", 1);
+      subs_.push_back(nh_.subscribe<ocs2_msgs::mpc_observation>(
+          "/" + ns + "/" + ns + "_mpc_observation", 1,
+          boost::bind(&FleetPublisherNode::obsCb, this, _1, i)));
+      subs_.push_back(nh_.subscribe<nav_msgs::Odometry>(
+          "/" + ns + "/ground_truth/state", 1,
+          boost::bind(&FleetPublisherNode::gtCb, this, _1, i)));
+      subs_.push_back(nh_.subscribe<geometry_msgs::PoseStamped>(
+          "/" + ns + "/goal", 1, boost::bind(&FleetPublisherNode::goalCb, this, _1, i)));
+    }
+    subs_.push_back(nh_.subscribe<geometry_msgs::PoseStamped>(
+        "/formation/goal", 1, boost::bind(&FleetPublisherNode::formationGoalCb, this, _1)));
+
+    pnh_.param("viz_markers", viz_, true);
+    pnh_.param<std::string>("viz_frame", viz_frame_, "world");
+    if (viz_) marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/formation/admm_markers", 1);
+
+    bool kill_cpp; pnh_.param("kill_cpp_target", kill_cpp, false);
+    if (kill_cpp) killCppTargets();
+
+    std::string default_csv = ros::package::getPath("legged_upper_control") +
+                              "/docs/progress/fleet_track.csv";
+    pnh_.param<std::string>("log_csv", csv_path_, default_csv);
+    csv_.open(csv_path_.c_str());
+    if (csv_.is_open()) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "# fleet rung2 formation=%s w_form=%.1f v=%.3f\n",
+                    formation_name_.c_str(), w_form_, v_);
+      csv_ << buf << "t,";
+      for (size_t d = 0; d < dogs_.size(); ++d)
+        for (size_t c = 0; c < kDbgCols.size(); ++c)
+          csv_ << kDbgCols[c] << dogs_[d] << ((d + 1 == dogs_.size() && c + 1 == kDbgCols.size()) ? "" : ",");
+      csv_ << "\n"; csv_.flush();
+    }
+    std::string hpath; pnh_.param<std::string>("log_hist_csv", hpath, "");
+    if (!hpath.empty()) {
+      hist_csv_.open(hpath.c_str());
+      if (hist_csv_.is_open()) hist_csv_ << "# ADMM residuals; row = t, r_prim[0..P-1], r_dual[0..P-1]\n";
+    }
+
+    timer_ = nh_.createTimer(ros::Duration(ts_), &FleetPublisherNode::tick, this);
+    ROS_INFO("[fleet_pub_cpp] dogs=3 formation=%s w_form=%.1f v=%.2f arena=%s obstacles=%zu",
+             formation_name_.c_str(), w_form_, v_,
+             arena_name_.empty() ? "(empty)" : arena_name_.c_str(), coord_->obstacles().size());
+  }
+
+ private:
+  static const std::vector<std::string> kDbgCols;
+
+  void obsCb(const ocs2_msgs::mpc_observation::ConstPtr& m, int i) { obs_[i] = *m; has_obs_[i] = true; }
+  void gtCb(const nav_msgs::Odometry::ConstPtr& m, int i) { gt_[i] = *m; has_gt_[i] = true; }
+
+  void goalCb(const geometry_msgs::PoseStamped::ConstPtr& m, int i) {
+    goal_[i] = Eigen::Vector2d(m->pose.position.x, m->pose.position.y);
+    path_.erase(i); yaw_latched_[i] = false;
+    ROS_INFO("[fleet_pub_cpp] dog%d new goal (%.2f,%.2f)", i, goal_[i][0], goal_[i][1]);
+  }
+
+  void formationGoalCb(const geometry_msgs::PoseStamped::ConstPtr& m) {
+    for (int i : dogs_) if (!has_gt_[i]) { ROS_WARN("[fleet_pub_cpp] /formation/goal ignored: no state"); return; }
+    Eigen::Vector2d goal_c(m->pose.position.x, m->pose.position.y);
+    std::vector<Eigen::Vector2d> pos;
+    Eigen::Vector2d centroid(0, 0);
+    for (int i : dogs_) {
+      Eigen::Vector2d p(gt_[i].pose.pose.position.x, gt_[i].pose.pose.position.y);
+      pos.push_back(p); centroid += p;
+    }
+    centroid /= static_cast<double>(dogs_.size());
+    Eigen::Vector2d d = goal_c - centroid;
+    double yaw = (d.norm() > 0.25) ? std::atan2(d[1], d[0]) : last_formation_yaw_;
+    last_formation_yaw_ = yaw;
+    const auto* offsets = formation_->current_offsets();
+    if (offsets == nullptr || offsets->size() != dogs_.size()) {
+      ROS_WARN("[fleet_pub_cpp] /formation/goal ignored: no formation offsets"); return;
+    }
+    std::vector<Eigen::Vector2d> slots = admm::centroid_slot_targets(goal_c, *offsets, yaw);
+    std::vector<int> assign = admm::min_cost_assignment(pos, slots);
+    for (size_t k = 0; k < dogs_.size(); ++k) {
+      goal_[dogs_[k]] = slots[assign[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
+    }
+    ROS_INFO("[fleet_pub_cpp] /formation/goal centroid (%.2f,%.2f) yaw=%.2f", goal_c[0], goal_c[1], yaw);
+  }
+
+  bool ready() const {
+    for (int i : dogs_) {
+      auto o = has_obs_.find(i); auto g = has_gt_.find(i);
+      if (o == has_obs_.end() || !o->second) return false;
+      if (g == has_gt_.end() || !g->second) return false;
+      if (obs_.at(i).time == 0.0) return false;
+    }
+    return true;
+  }
+
+  // world X0 (px,py,vx,vy) + P0 (px,py): gt position + EMA/clamped obs velocity.
+  void x0(int i, Eigen::Vector4d& X0, Eigen::Vector2d& P0) {
+    const auto& s = obs_[i].state.value;
+    const auto& gp = gt_[i].pose.pose.position;
+    P0 = Eigen::Vector2d(gp.x, gp.y);
+    Eigen::Vector2d vraw(s[MOM_LIN_X], s[MOM_LIN_Y]);
+    if (!has_vema_[i]) { v_ema_[i] = vraw; has_vema_[i] = true; }
+    else v_ema_[i] = 0.25 * vraw + 0.75 * v_ema_[i];
+    double vx0 = clip(v_ema_[i][0], -admm::MAX_VX, admm::MAX_VX);
+    double vy0 = clip(v_ema_[i][1], -admm::MAX_VY, admm::MAX_VY);
+    X0 = Eigen::Vector4d(P0[0], P0[1], vx0, vy0);
+  }
+
+  Eigen::MatrixX2d waypoints(int i, const Eigen::Vector2d& P0i) {
+    if (!planner_) return to_mat({P0i, goal_[i]});
+    if (path_.find(i) == path_.end()) {
+      auto rg = planner_->find_reachable_goal(P0i, goal_[i]);
+      path_[i] = rg.path.empty() ? std::vector<Eigen::Vector2d>{P0i, goal_[i]} : rg.path;
+    }
+    return to_mat(path_[i]);
+  }
+
+  void tick(const ros::TimerEvent&) {
+    if (!ready()) { ROS_WARN_THROTTLE(2.0, "[fleet_pub_cpp] waiting for all 3 obs+gt ..."); return; }
+    std::map<int, Eigen::VectorXd> xnow;
+    std::map<int, Eigen::Vector2d> P0;
+    std::map<int, Eigen::MatrixXd> xdes;
+    for (int i : dogs_) {
+      Eigen::Vector4d X0; Eigen::Vector2d p0; x0(i, X0, p0);
+      xnow[i] = X0; P0[i] = p0;
+    }
+    for (int i : dogs_)
+      xdes[i] = admm::build_reference(P0[i], waypoints(i, P0[i]), admm::N, admm::TS, v_, 0.80);
+
+    std::map<int, Eigen::VectorXd> xi;
+    admm::ADMMCoordinator::Hist hist;
+    try {
+      auto res = coord_->step(xnow, xdes);
+      xi = res.first; hist = res.second;
+    } catch (const std::exception& e) {
+      ROS_WARN_THROTTLE(2.0, "[fleet_pub_cpp] coord.step failed: %s", e.what()); return;
+    }
+
+    if (hist_csv_.is_open()) {
+      char b[32]; std::snprintf(b, sizeof(b), "%.4f,", obs_[dogs_[0]].time); hist_csv_ << b;
+      for (size_t k = 0; k < hist.r_prim.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_prim[k]); hist_csv_ << b << ","; }
+      for (size_t k = 0; k < hist.r_dual.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_dual[k]); hist_csv_ << b << (k + 1 < hist.r_dual.size() ? "," : ""); }
+      hist_csv_ << "\n"; hist_csv_.flush();
+    }
+
+    for (int i : dogs_)
+      if (!xi[i].allFinite()) { ROS_WARN_THROTTLE(1.0, "[fleet_pub_cpp] ADMM xi non-finite -> HOLD"); return; }
+
+    std::map<int, Eigen::VectorXd> wpx, wpy;
+    for (int i : dogs_) {
+      Eigen::VectorXd px(admm::N), py(admm::N);
+      for (int k = 1; k <= admm::N; ++k) { px[k - 1] = xi[i][admm::px_index(k)]; py[k - 1] = xi[i][admm::py_index(k)]; }
+      wpx[i] = px; wpy[i] = py;
+    }
+    if (viz_) publishMarkers(wpx, wpy);
+
+    std::map<int, std::vector<double>> dbg;  // per-dog instrumentation for CSV
+    for (int i : dogs_) {
+      const auto& s = obs_[i].state.value;
+      Eigen::VectorXd xi_mpc = xi[i];
+      double dx = s[BASE_PX] - P0[i][0], dy = s[BASE_PY] - P0[i][1];
+      for (int k = 1; k <= admm::N; ++k) { xi_mpc[admm::px_index(k)] += dx; xi_mpc[admm::py_index(k)] += dy; }
+      std::vector<std::pair<Eigen::VectorXd, Eigen::VectorXd>> others;
+      for (int j : dogs_) if (j != i) others.push_back({wpx[j], wpy[j]});
+      int k_send = admm::safe_prefix_length(wpx[i], wpy[i], others, d_safe_, send_cap_);
+      auto out = adapter_->build_target(xi_mpc, obs_[i].time, s[BASE_YAW], "path", k_send);
+      Eigen::MatrixXd states = out.states;  // (ns, 24)
+
+      double d_goal = std::hypot(P0[i][0] - goal_[i][0], P0[i][1] - goal_[i][1]);
+      if (!yaw_latched_[i]) {
+        if (d_goal < r_latch_) { yaw_latched_[i] = true; yaw_latch_val_[i] = s[BASE_YAW]; }
+      } else if (d_goal > r_latch_ + latch_margin_) {
+        yaw_latched_[i] = false;
+      }
+      if (yaw_latched_[i])
+        for (int r = 0; r < states.rows(); ++r) states(r, BASE_YAW) = yaw_latch_val_[i];
+
+      pub_[i].publish(toMsg(out.times, states));
+      dbg[i] = {gt_[i].pose.pose.position.x, gt_[i].pose.pose.position.y,
+                (double)s[BASE_PX], (double)s[BASE_PY], dx, dy,
+                (double)s[MOM_LIN_X], (double)s[MOM_LIN_Y], xnow[i][2], xnow[i][3],
+                states(0, BASE_PX), states(0, BASE_PY), (double)s[BASE_YAW],
+                states(0, BASE_YAW), (double)k_send};
+    }
+    logCsv(dbg);
+  }
+
+  ocs2_msgs::mpc_target_trajectories toMsg(const Eigen::VectorXd& times, const Eigen::MatrixXd& states) {
+    ocs2_msgs::mpc_target_trajectories m;
+    int ns = static_cast<int>(times.size());
+    for (int j = 0; j < ns; ++j) {
+      m.timeTrajectory.push_back(times[j]);
+      ocs2_msgs::mpc_state st; st.value.resize(24);
+      for (int c = 0; c < 24; ++c) st.value[c] = static_cast<float>(states(j, c));
+      m.stateTrajectory.push_back(st);
+      ocs2_msgs::mpc_input in; in.value.assign(24, 0.0f);
+      m.inputTrajectory.push_back(in);
+    }
+    return m;
+  }
+
+  void logCsv(const std::map<int, std::vector<double>>& dbg) {
+    if (!csv_.is_open()) return;
+    char b[32]; std::snprintf(b, sizeof(b), "%.4f", obs_[dogs_[0]].time); csv_ << b;
+    for (int i : dogs_) {
+      for (double v : dbg.at(i)) { std::snprintf(b, sizeof(b), "%.5f", v); csv_ << "," << b; }
+    }
+    csv_ << "\n"; csv_.flush();
+  }
+
+  void publishMarkers(const std::map<int, Eigen::VectorXd>& wpx, const std::map<int, Eigen::VectorXd>& wpy) {
+    visualization_msgs::MarkerArray arr;
+    int j = 0;
+    for (const auto& o : coord_->obstacles()) {
+      std::vector<Eigen::Vector3d> pts;
+      for (int k = 0; k <= 24; ++k) {
+        double a = 2 * M_PI * k / 24.0;
+        pts.emplace_back(o.pos[0] + o.radius * std::cos(a), o.pos[1] + o.radius * std::sin(a), 0.05);
+      }
+      arr.markers.push_back(lineMarker("obstacles", j++, pts, 0.55, 0.55, 0.55, 0.03));
+    }
+    static const std::map<int, Eigen::Vector3d> rgb = {
+        {1, {0.90, 0.20, 0.20}}, {2, {0.20, 0.80, 0.30}}, {3, {0.20, 0.45, 0.95}}};
+    std::map<int, Eigen::Vector2d> pos;
+    for (int i : dogs_) pos[i] = Eigen::Vector2d(gt_[i].pose.pose.position.x, gt_[i].pose.pose.position.y);
+    for (int i : dogs_) {
+      Eigen::Vector3d c = rgb.at(i);
+      std::vector<Eigen::Vector3d> roll;
+      for (int k = 0; k < wpx.at(i).size(); ++k) roll.emplace_back(wpx.at(i)[k], wpy.at(i)[k], 0.1);
+      arr.markers.push_back(lineMarker("rollout", i, roll, c[0], c[1], c[2], 0.05));
+      arr.markers.push_back(sphereMarker("dog", i, pos[i], c, 0.22));
+      arr.markers.push_back(sphereMarker("slot", i, goal_[i], c, 0.12));
+    }
+    std::vector<Eigen::Vector3d> ep;
+    for (size_t a = 0; a < dogs_.size(); ++a)
+      for (size_t b = a + 1; b < dogs_.size(); ++b) {
+        ep.emplace_back(pos[dogs_[a]][0], pos[dogs_[a]][1], 0.1);
+        ep.emplace_back(pos[dogs_[b]][0], pos[dogs_[b]][1], 0.1);
+      }
+    auto fm = lineMarker("formation", 0, ep, 1.0, 0.85, 0.1, 0.03);
+    fm.type = visualization_msgs::Marker::LINE_LIST;
+    arr.markers.push_back(fm);
+    marker_pub_.publish(arr);
+  }
+
+  visualization_msgs::Marker lineMarker(const std::string& ns, int id,
+                                        const std::vector<Eigen::Vector3d>& pts,
+                                        double r, double g, double b, double w) {
+    visualization_msgs::Marker m;
+    m.header.frame_id = viz_frame_; m.lifetime = ros::Duration(3 * ts_);
+    m.ns = ns; m.id = id; m.type = visualization_msgs::Marker::LINE_STRIP;
+    m.action = visualization_msgs::Marker::ADD; m.scale.x = w; m.pose.orientation.w = 1.0;
+    m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 1.0;
+    for (const auto& p : pts) { geometry_msgs::Point q; q.x = p[0]; q.y = p[1]; q.z = p[2]; m.points.push_back(q); }
+    return m;
+  }
+
+  visualization_msgs::Marker sphereMarker(const std::string& ns, int id, const Eigen::Vector2d& xy,
+                                          const Eigen::Vector3d& c, double d) {
+    visualization_msgs::Marker m;
+    m.header.frame_id = viz_frame_; m.lifetime = ros::Duration(3 * ts_);
+    m.ns = ns; m.id = id; m.type = visualization_msgs::Marker::SPHERE;
+    m.action = visualization_msgs::Marker::ADD;
+    m.scale.x = m.scale.y = m.scale.z = d; m.pose.orientation.w = 1.0;
+    m.pose.position.x = xy[0]; m.pose.position.y = xy[1]; m.pose.position.z = 0.1;
+    m.color.r = c[0]; m.color.g = c[1]; m.color.b = c[2]; m.color.a = 1.0;
+    return m;
+  }
+
+  void killCppTargets() {
+    std::vector<std::string> targets;
+    for (int i : dogs_) targets.push_back("/dog" + std::to_string(i) + "/legged_robot_target");
+    std::vector<bool> killed(targets.size(), false);
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      std::string live;
+      if (FILE* p = popen("rosnode list 2>/dev/null", "r")) {
+        char ln[256]; while (fgets(ln, sizeof(ln), p)) live += ln; pclose(p);
+      }
+      bool all = true;
+      for (size_t t = 0; t < targets.size(); ++t) {
+        if (killed[t]) continue;
+        if (live.find(targets[t]) != std::string::npos) {
+          std::string cmd = "rosnode kill " + targets[t] + " >/dev/null 2>&1";
+          if (std::system(cmd.c_str()) == 0) killed[t] = true;
+        }
+        if (!killed[t]) all = false;
+      }
+      if (all) break;
+      ros::Duration(0.5).sleep();
+    }
+  }
+
+  ros::NodeHandle nh_, pnh_;
+  std::vector<int> dogs_;
+  std::vector<admm::EdgeKey> edges_;
+  int N_; double ts_, v_, com_height_, w_form_;
+  std::string formation_name_, arena_name_, viz_frame_, csv_path_;
+  std::map<int, Eigen::Vector2d> goal_;
+  std::unique_ptr<admm::LaplacianFormation> formation_;
+  std::unique_ptr<admm::ADMMCoordinator> coord_;
+  std::unique_ptr<admm::MotionAdapter> adapter_;
+  std::unique_ptr<admm::AStarPlanner> planner_;
+  std::vector<admm::ArenaRect> arena_rects_;
+  double last_formation_yaw_ = 0.0, r_latch_, latch_margin_, d_safe_;
+  int send_cap_; bool use_astar_, viz_;
+  std::map<int, bool> yaw_latched_; std::map<int, double> yaw_latch_val_;
+  std::map<int, std::vector<Eigen::Vector2d>> path_;
+  std::map<int, ocs2_msgs::mpc_observation> obs_; std::map<int, bool> has_obs_;
+  std::map<int, nav_msgs::Odometry> gt_; std::map<int, bool> has_gt_;
+  std::map<int, Eigen::Vector2d> v_ema_; std::map<int, bool> has_vema_;
+  std::map<int, ros::Publisher> pub_;
+  ros::Publisher marker_pub_;
+  std::vector<ros::Subscriber> subs_;
+  ros::Timer timer_;
+  std::ofstream csv_, hist_csv_;
+};
+
+const std::vector<std::string> FleetPublisherNode::kDbgCols = {
+    "gt_x", "gt_y", "estpx", "estpy", "dx", "dy", "obsvx", "obsvy",
+    "x0vx", "x0vy", "tgt1x", "tgt1y", "seed", "cmd", "ksend"};
+
+int main(int argc, char** argv) {
+  ros::init(argc, argv, "ocs2_fleet_publisher");
+  FleetPublisherNode node;
+  ros::spin();
+  return 0;
+}
