@@ -10,6 +10,7 @@
 <launch>
     <arg name="robot_type" default="a1"/>
     <arg name="gui"        default="true"/>
+    <param name="/admm_arena" value="plum"/>   <!-- admm_demo auto-match -->
 
     <include file="$(find gazebo_ros)/launch/empty_world.launch">
         <arg name="world_name"   value="$(find legged_gazebo)/worlds/three_dogs_plum.world"/>

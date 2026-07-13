@@ -15,7 +15,6 @@ gait_broadcaster.py
 執行前提:
   1. Gazebo + fleet_bringup 已啟動
   2. 每隻狗的 legged_controller 已 switch_controller start
-  3. OCS2 的 GaitReceiver.cpp 已移除 TransportHints().udp() 並重編
 """
 import argparse
 import math

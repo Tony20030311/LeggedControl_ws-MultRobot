@@ -7,8 +7,9 @@
        rostopic pub -1 /formation/goal geometry_msgs/PoseStamped \
          "{header: {frame_id: 'world'}, pose: {position: {x: 9.0, y: 0.0, z: 0.5}}}" -->
 <launch>
-  <arg name="arena"        default="plum"/>
-  <arg name="v"            default="0.20"/>
+  <!-- empty = auto-match scene launch; arena:=door to override -->
+  <arg name="arena"        default=""/>
+  <arg name="v"            default="0.2"/>
   <arg name="astar_radius" default="0.35"/>
   <arg name="yaw_rate_max" default="1.2"/>
   <arg name="rviz"         default="true"/>

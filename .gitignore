@@ -12,3 +12,16 @@ __pycache__/
 .claude/settings.local.json
 .claude/settings.json
 graphify-out/
+
+# --- GitHub backup: keep repo minimal (2026-07-13) ---
+# root: only Dockerfile + run_container.sh + this file are pushed
+/source.sh
+/docker_exec.sh
+.claude/
+# all markdown (docs, notes, CLAUDE.md) — local only, not pushed
+*.md
+# ...except the launch usage README (run instructions someone cloning needs)
+!src/legged_control/legged_upper_control_pkg/launch/README.md
+# admm test/verify suite — kept locally as the C++ regression net, not pushed
+/src/legged_control/legged_upper_control_pkg/legged_upper_control/admm/test_*.py
+/src/legged_control/legged_upper_control_pkg/legged_upper_control/admm/verify_*.py

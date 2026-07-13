@@ -1,40 +1,106 @@
 Panels:
   - Class: rviz/Displays
+    Help Height: 70
     Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.5
+    Tree Height: 585
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
 Visualization Manager:
-  Global Options:
-    Fixed Frame: world
-    Background Color: 30; 30; 30
-    Frame Rate: 30
+  Class: ""
   Displays:
-    - Class: rviz/Grid
-      Name: Grid
-      Enabled: true
+    - Alpha: 0.5
       Cell Size: 1
-      Plane Cell Count: 24
+      Class: rviz/Grid
       Color: 100; 100; 100
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 24
+      Reference Frame: <Fixed Frame>
+      Value: true
     - Class: rviz/TF
-      Name: TF
       Enabled: false
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Alpha: 1
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
+      Value: false
     - Class: rviz/MarkerArray
-      Name: ADMM rollout
       Enabled: true
       Marker Topic: /formation/admm_markers
+      Name: ADMM rollout
+      Namespaces:
+        dog: true
+        formation: true
+        obstacles: true
+        rollout: true
+        slot: true
       Queue Size: 10
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 30; 30; 30
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
   Tools:
     - Class: rviz/MoveCamera
     - Class: rviz/Select
+  Value: true
   Views:
     Current:
       Class: rviz/Orbit
-      Name: Orbit
       Distance: 16
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.7853981852531433
       Focal Point:
         X: 5
         Y: 0
         Z: 0
-      Pitch: 1.2
-      Yaw: 3.14
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 1.2000000476837158
+      Target Frame: <Fixed Frame>
+      Yaw: 3.140000104904175
+    Saved: ~
 Window Geometry:
-  Height: 800
-  Width: 1200
+  Displays:
+    collapsed: true
+  Height: 1007
+  Hide Left Dock: true
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd000000010000000000000156000002cafc0200000001fb000000100044006900730070006c006100790073000000003b000002ca000000c700ffffff000003b40000039900000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Width: 948
+  X: 983
+  Y: 32

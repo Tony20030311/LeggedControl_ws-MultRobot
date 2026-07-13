@@ -65,8 +65,10 @@ class FleetPublisherNode {
     pnh_.param("v", v_, 0.15);
     pnh_.param("com_height", com_height_, 0.30);
     pnh_.param<std::string>("formation", formation_name_, "V");
-    pnh_.param("w_form", w_form_, 10.0);
+    pnh_.param("w_form", w_form_, 0.3);   // loose default: single-file through tight gaps
     pnh_.param<std::string>("arena", arena_name_, "");
+    // no arena given -> use the one the scene launch set
+    if (arena_name_.empty()) ros::param::get("/admm_arena", arena_name_);
 
     // arena selection: "" (or unknown) -> empty world (no obstacles, DEFAULT_GOALS)
     const auto& arenas = admm::arenas();
