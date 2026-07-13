@@ -60,3 +60,36 @@ Every stage/arena has an offline gate (`verify_*.py` / `test_*.py`) that must be
 Gazebo; Gazebo validation is by real headless runs with full-log red-flag scans. Verification
 runs in the Docker container (osqp 0.6.3, ROS sourced). Recording pipeline (xvfb + software GL
 + ffmpeg x11grab) is in `scratchpad/arena/run_plum_record.sh`.
+
+## C6 — ADMM C++ migration (Stage 5), 2026-07-13
+
+Core (C0–C5) + dependencies/shell (C6a–f) ported to C++, offline bit-identical
+(`test_cpp_parity.py`) and Gazebo statistically equivalent to the Python shell.
+
+- **C6e** Gazebo smoke (rospy shell + C++ core, `ADMM_IMPL=cpp`): surfaced + fixed the
+  `ADMMCoordinator.obstacles` binding gap (publisher crashed at `__init__` — offline parity
+  can't see the shell↔core boundary). empty/door/plum all green after.
+- **C6f** roscpp node `ocs2_fleet_publisher_node.cpp` (mirror of the Python publisher,
+  links admm_core). Synthetic-loop gate (`scratchpad/arena/smoke_fleet_node.py`) passes
+  against BOTH the rospy shell and the node. Committed 7e9f05c.
+- **C6g** statistical-equivalence campaign, roscpp node (`PUB=cpp`), 3 runs × 3 maps, all
+  green (fell/sqp/crash/pyerr/nanholds/gaps = 0):
+
+  | map   | node min_pair (×3)      | Python-shell baseline |
+  |-------|-------------------------|-----------------------|
+  | empty | 0.829 / 0.848 / 0.809   | ~0.78                 |
+  | plum  | 0.768 / 0.799 / 0.785   | ~0.75 (all threaded)  |
+  | door  | 0.595 / 0.597 / 0.599   | 0.591 / 0.595         |
+
+  min_pair distributions match within sim noise → node ≡ shell behaviourally.
+
+- **Also this session** (r_prim data + stress campaigns, `PUB` scripts are scratchpad-local):
+  plum 3× round-trip thread (all 3 dogs through the pegs), door 11-leg choreography (direct
+  side-exit works but is marginal — one run exited both sides, another stalled from the right;
+  no fall/crash). ADMM per-iter residual (`~log_hist_csv`): r_prim (true-body vs edge-copy) ≈
+  1e-14 when spread, spikes to ~0.5 m initial when the inter-agent CBF binds but converges to
+  ≤2 cm by iter 20; obstacle-CBF clearance grazed −0.01..−0.05 m at GT (tracking overshoot of
+  the r_eff=0.60 barrier) with ~0.25 m physical margin to the obstacle surface, no collision.
+
+- **Remaining — C6h:** delete the Python ADMM core + rospy shell + `ADMM_IMPL` switch + parity
+  tools; `admm_impl.py` → unconditional cpp; launches → node; graphify update; push GitHub.
