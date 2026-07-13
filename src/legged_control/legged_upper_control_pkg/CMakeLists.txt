@@ -55,7 +55,7 @@ if(pybind11_FOUND AND osqp_FOUND AND Eigen3_FOUND)
   install(TARGETS admm_core_cpp
     LIBRARY DESTINATION ${CATKIN_GLOBAL_PYTHON_DESTINATION})
 
-  # ── roscpp mirror of scripts/ocs2_fleet_publisher.py (C6f) ──
+  # ── roscpp ADMM fleet publisher node (C6f; the Python shell was retired at C6h) ──
   # links admm_core directly (no pybind); needs roscpp + ocs2_msgs from catkin.
   add_executable(ocs2_fleet_publisher_node src/ocs2_fleet_publisher_node.cpp)
   target_include_directories(ocs2_fleet_publisher_node PRIVATE include ${catkin_INCLUDE_DIRS})

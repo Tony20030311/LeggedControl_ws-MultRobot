@@ -8,8 +8,8 @@ wall boxes as rect obstacles (routes through the 2.5m gap) and the node CBF gets
 door-POSTS at the corners. Boundary walls (right/top/bottom, no gap) are node-CBF
 half-planes — valid, and the first time a wall CBF is checked in the loop.
 
-Imports ARENAS["door"] (obstacles + walls + rects + goals) straight from
-scripts/ocs2_fleet_publisher.py so geometry can't drift from what the robot runs (and from
+Imports ARENAS["door"] (obstacles + walls + rects + goals) through the admm_impl shim
+(admm_core_cpp fleet_config) so geometry can't drift from what the robot runs (and from
 the cylinders/walls in legged_gazebo/worlds/obstacle_world.world, paired by eye).
 
 Gate:

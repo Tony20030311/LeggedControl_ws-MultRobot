@@ -91,5 +91,15 @@ Core (C0–C5) + dependencies/shell (C6a–f) ported to C++, offline bit-identic
   ≤2 cm by iter 20; obstacle-CBF clearance grazed −0.01..−0.05 m at GT (tracking overshoot of
   the r_eff=0.60 barrier) with ~0.25 m physical margin to the obstacle surface, no collision.
 
-- **Remaining — C6h:** delete the Python ADMM core + rospy shell + `ADMM_IMPL` switch + parity
-  tools; `admm_impl.py` → unconditional cpp; launches → node; graphify update; push GitHub.
+- **C6h — DONE (migration complete):** deleted the Python ADMM core (constants, rti_linearizer,
+  node/edge_subproblem, admm_coordinator, motion_adapter, reference), the rospy shell
+  (`scripts/ocs2_fleet_publisher.py`), and the parity/perf tools (`test_cpp_parity`,
+  `test_node_qp/edge_qp/rti`, `bench_timing`). `admm_impl.py` is now unconditional cpp (the
+  `ADMM_IMPL` switch is gone); `admm_demo.launch` runs `type=ocs2_fleet_publisher_node`. C++ is
+  the sole implementation. **Verified before deletion** (all in the SIL container, C++ shim):
+  34/34 retained unit tests + 8/8 verify gates (stage1–4/arena/door/plum/edge_handoff) green,
+  grep = 0 live refs to the deleted modules, `catkin build legged_upper_control` green, and a
+  door confidence run via the NEW launch path (`admm_demo.launch` → node) — full through-door
+  round trip, fell/sqp/crash/nanholds/gaps = 0, min_pair 0.736 ≥ 0.60 over 2228 ticks, fleet
+  settled at the commanded centroid (0.09 m). Re-verified green AFTER deletion. The retained
+  tests/verify still route through the `admm_impl` shim, now exercising the C++ port.

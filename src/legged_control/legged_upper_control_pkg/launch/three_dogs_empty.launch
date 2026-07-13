@@ -6,7 +6,7 @@
   gui 預設 false = headless(方便自動化自駕);要看畫面就 gui:=true。
   spawn 位置沿用 five_dogs.launch 的 V 佈局(dog1 領前)。
   控制器另外用 fleet_bringup.launch 載;站立/trot 用 start_fleet.sh;
-  之後跑 scripts/ocs2_fleet_publisher.py 發三 target。
+  之後跑 ADMM publisher(rosrun … ocs2_fleet_publisher_node,或 admm_demo.launch)發三 target。
 -->
 <launch>
     <arg name="robot_type" default="a1"/>

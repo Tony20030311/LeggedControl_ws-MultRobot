@@ -6,7 +6,7 @@
   (2.5m door at x=6 + 5 cylinders + boundary walls) with 3 dogs (not 5). For the ADMM
   fleet: run publisher with _arena:=door _use_astar:=true (A* routes through the door;
   node CBF = cylinders + door posts + boundary wall half-planes). gui default false.
-  Geometry aligned to ARENAS["door"] in ocs2_fleet_publisher.py.
+  Geometry aligned to ARENAS["door"] in the C++ fleet_config (admm_core).
 -->
 <launch>
     <arg name="robot_type" default="a1"/>

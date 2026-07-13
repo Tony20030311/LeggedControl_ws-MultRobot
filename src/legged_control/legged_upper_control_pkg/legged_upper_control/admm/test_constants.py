@@ -11,11 +11,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-# ADMM_IMPL=cpp runs this same gate against the C++ port (admm_core_cpp).
-if os.environ.get("ADMM_IMPL", "python") == "cpp":
-    from admm_core_cpp import constants as C  # noqa: E402
-else:
-    import constants as C  # noqa: E402
+# C6h: Python retired — this gate runs against the C++ port via the shim.
+from admm_impl import constants as C  # noqa: E402
 
 
 # --- detail 2: second-order HOCBF coefficients (gamma1 gamma2 POSITIVE) --------

@@ -6,7 +6,7 @@
   給 ADMM 三狗編隊 node 圓障礙 CBF 上 Gazebo 驗證用。
   gui 預設 false = headless。spawn 位置沿用 five_dogs.launch 的 V 佈局。
   控制器另外用 fleet_bringup.launch 載;站立/trot 用 start_fleet.sh;之後跑
-  scripts/ocs2_fleet_publisher.py _arena:=obstacles(障礙座標對齊 world 的 cylinder)。
+  ocs2_fleet_publisher_node _arena:=obstacles(障礙座標對齊 world 的 cylinder)。
 -->
 <launch>
     <arg name="robot_type" default="a1"/>

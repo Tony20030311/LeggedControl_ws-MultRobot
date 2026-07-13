@@ -13,7 +13,7 @@
   <arg name="yaw_rate_max" default="1.2"/>
   <arg name="rviz"         default="true"/>
 
-  <node pkg="legged_upper_control" type="ocs2_fleet_publisher.py"
+  <node pkg="legged_upper_control" type="ocs2_fleet_publisher_node"
         name="ocs2_fleet_publisher" output="screen">
     <param name="arena"             value="$(arg arena)"/>
     <param name="use_astar"         value="true"/>

@@ -3,8 +3,8 @@ CBF, closed loop, OPEN FIELD (no walls, no door).
 
 This is the offline sanity for wiring the node obstacle CBF onto Gazebo
 (three_dogs_obstacles.launch). It closes the loop on the SAME arena the fleet
-publisher publishes -- it imports ARENAS straight from
-scripts/ocs2_fleet_publisher.py so the CBF geometry can never drift from what runs
+publisher publishes -- it imports ARENAS through the admm_impl shim
+(admm_core_cpp fleet_config) so the CBF geometry can never drift from what runs
 on the robot (the arena obstacle "pos" must also match the cylinders in
 legged_gazebo/worlds/three_dogs_obstacles.world; that pairing is checked by eye /
 Gazebo, this script checks the CBF math).

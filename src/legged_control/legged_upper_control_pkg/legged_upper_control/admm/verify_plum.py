@@ -8,8 +8,8 @@ that straight line -> the reactive single-linearization CBF cannot find the glob
 lesson. The fix is the EXISTING core.planning.AStarPlanner feeding the EXISTING
 build_reference (which already samples a polyline) -- no ADMM-core change.
 
-Imports ARENAS["plum"] straight from scripts/ocs2_fleet_publisher.py so the peg geometry
-+ goals can NEVER drift from what the fleet publisher runs on the robot (and from the
+Imports ARENAS["plum"] through the admm_impl shim (admm_core_cpp fleet_config) so the peg
+geometry + goals can NEVER drift from what the fleet publisher runs on the robot (and from the
 Gazebo cylinders in legged_gazebo/worlds/three_dogs_plum.world, paired by eye).
 
 Gate (a bad curve is a bug to REPORT, never tune geometry to force):
