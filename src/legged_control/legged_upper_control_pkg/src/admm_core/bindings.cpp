@@ -541,7 +541,7 @@ PYBIND11_MODULE(admm_core_cpp, m) {
                          const py::sequence& dogs, const py::sequence& edges,
                          const py::object& formation, double w_form,
                          const py::object& obstacles, const py::object& walls,
-                         int hard_through, bool parallel) {
+                         int hard_through, bool parallel, double robot_margin) {
                  std::vector<int> dg;
                  for (const auto& d : dogs) dg.push_back(d.cast<int>());
                  std::vector<admm::EdgeKey> eg;
@@ -557,7 +557,7 @@ PYBIND11_MODULE(admm_core_cpp, m) {
                      p_iters.is_none() ? admm::P_ITERS : p_iters.cast<int>(),
                      rho.is_none() ? admm::RHO : rho.cast<double>(), dg, eg, form,
                      w_form, parse_obstacles(obstacles), parse_walls(walls),
-                     hard_through, parallel);
+                     hard_through, parallel, robot_margin);
              }),
              py::arg("p_iters") = py::none(), py::arg("rho") = py::none(),
              py::arg("dogs") = py::make_tuple(1, 2),
@@ -565,6 +565,7 @@ PYBIND11_MODULE(admm_core_cpp, m) {
              py::arg("formation") = py::none(), py::arg("w_form") = 0.0,
              py::arg("obstacles") = py::none(), py::arg("walls") = py::none(),
              py::arg("hard_through") = 1, py::arg("parallel") = false,
+             py::arg("robot_margin") = 0.30,
              py::keep_alive<1, 6>())  // coordinator keeps the formation alive
         .def_readonly("N", &admm::ADMMCoordinator::N_)
         .def_readonly("cycle", &admm::ADMMCoordinator::cycle_)

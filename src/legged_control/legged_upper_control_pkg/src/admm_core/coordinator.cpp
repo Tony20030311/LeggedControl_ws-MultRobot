@@ -29,7 +29,7 @@ ADMMCoordinator::ADMMCoordinator(int p_iters, double rho, std::vector<int> dogs,
                                  const LaplacianFormation* formation, double w_form,
                                  std::vector<Obstacle> obstacles,
                                  std::vector<Wall> walls, int hard_through,
-                                 bool parallel)
+                                 bool parallel, double robot_margin)
     : rho_(rho),
       P_(p_iters),
       hard_through_(hard_through),
@@ -47,7 +47,7 @@ ADMMCoordinator::ADMMCoordinator(int p_iters, double rho, std::vector<int> dogs,
     }
     for (const int i : dogs_)
         node_[i] = std::make_unique<NodeSubproblem>(
-            obstacles, walls, /*robot_margin=*/0.30, /*q_pos=*/10.0, /*q_v=*/1.0,
+            obstacles, walls, robot_margin, /*q_pos=*/10.0, /*q_v=*/1.0,
             /*r_accel=*/0.5, /*w_pred=*/20.0, /*n=*/N, rho_,
             static_cast<int>(neighbors_[i].size()), w_form_);
     for (const EdgeKey& e : edges_)
@@ -203,7 +203,7 @@ ADMMCoordinator::step(const std::map<int, Eigen::VectorXd>& xnow,
             lam[e][e.second] = lam[e][e.second] + (xi[e.second] - z[e][e.second]);
         }
         // residuals (spec C5.4) — np.sum uses pairwise summation, mirrored exactly
-        double rp2 = 0.0, rd2 = 0.0;
+        double rp2 = 0.0, rd2 = 0.0, pos_max = 0.0, vel_max = 0.0;
         std::vector<double> sq(nz);
         for (const EdgeKey& e : edges_)
             for (const int i : {e.first, e.second}) {
@@ -213,9 +213,18 @@ ADMMCoordinator::step(const std::map<int, Eigen::VectorXd>& xnow,
                 const Eigen::VectorXd d2 = z[e][i] - z_prev[e][i];
                 for (int j = 0; j < nz; ++j) sq[j] = d2(j) * d2(j);
                 rd2 += numpy_pairwise_sum(sq.data(), sq.size());
+                // per-iter plan change, split into max position (m) vs max velocity (m/s)
+                for (int k = 1; k <= N_; ++k) {
+                    pos_max = std::max({pos_max, std::abs(d2(px_index(k, N_))),
+                                        std::abs(d2(px_index(k, N_) + 1))});
+                    vel_max = std::max({vel_max, std::abs(d2(vx_index(k, N_))),
+                                        std::abs(d2(vx_index(k, N_) + 1))});
+                }
             }
         hist.r_prim.push_back(std::sqrt(rp2));
         hist.r_dual.push_back(rho_ * std::sqrt(rd2));
+        hist.r_pos.push_back(pos_max);
+        hist.r_vel.push_back(vel_max);
         hist.h2_viol.push_back(h2_viol_(xi, xnow));
         z_prev = z;
     }

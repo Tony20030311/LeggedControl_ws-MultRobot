@@ -5,12 +5,18 @@
      Run AFTER: three_dogs_plum.launch -> fleet_bringup.launch -> start_fleet.sh trot.
      Then command the fleet with ONE centroid point:
        rostopic pub -1 /formation/goal geometry_msgs/PoseStamped \
-         "{header: {frame_id: 'world'}, pose: {position: {x: 9.0, y: 0.0, z: 0.5}}}" -->
+         "{header: {frame_id: 'world'}, pose: {position: {x: 9.0, y: 0.0, z: 0.5}}}"
+     DOOR demo (three_dogs_door.launch): use the legacy-aligned inflation, Gazebo-proven
+     (15-round + fuzz campaigns 2026-07-15) -- the defaults leave door pockets infeasible:
+       roslaunch legged_upper_control admm_demo.launch arena:=door \
+         robot_margin:=0.20 astar_radius:=0.20 -->
 <launch>
   <!-- empty = auto-match scene launch; arena:=door to override -->
   <arg name="arena"        default=""/>
   <arg name="v"            default="0.2"/>
   <arg name="astar_radius" default="0.35"/>
+  <arg name="robot_margin" default="0.30"/>  <!-- obstacle CBF: r_eff = radius + this -->
+
   <arg name="yaw_rate_max" default="1.2"/>
   <arg name="rviz"         default="true"/>
 
@@ -21,6 +27,7 @@
     <param name="v"                 value="$(arg v)"/>
     <param name="yaw_mode"          value="path"/>
     <param name="astar_robot_radius" value="$(arg astar_radius)"/>
+    <param name="robot_margin"      value="$(arg robot_margin)"/>
     <param name="astar_x_max"       value="11.0"/>
     <param name="yaw_rate_max"      value="$(arg yaw_rate_max)"/>
     <param name="kill_cpp_target"   value="true"/>   <!-- step 4 -->

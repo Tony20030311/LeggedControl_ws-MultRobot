@@ -91,9 +91,11 @@ class FleetPublisherNode {
 
     formation_.reset(new admm::LaplacianFormation(admm::formations()));
     formation_->set_formation(formation_name_);
+    int hard_through; pnh_.param("hard_through", hard_through, 1);  // diag: # of hard edge-CBF steps (k=0..hard_through-1)
+    double robot_margin; pnh_.param("robot_margin", robot_margin, 0.30);  // obstacle CBF inflation: r_eff = radius + this
     coord_.reset(new admm::ADMMCoordinator(admm::P_ITERS, admm::RHO, dogs_, edges_,
                                            formation_.get(), w_form_, arena_obs, arena_walls,
-                                           /*hard_through=*/1, /*parallel=*/false));
+                                           hard_through, /*parallel=*/false, robot_margin));
     int lookahead; double pos_eps, yaw_rate_max;
     pnh_.param("lookahead_m", lookahead, 5);
     pnh_.param("pos_eps", pos_eps, 0.02);
@@ -110,6 +112,15 @@ class FleetPublisherNode {
     pnh_.param("k_send", k_send_p, admm::K_SEND);
     pnh_.param("send_margin", send_margin, 0.0);
     send_cap_ = k_send_p; d_safe_ = admm::D_MIN + send_margin;
+
+    // #1 leader-aware follower speed (ACC/car-following): a follower must not out-run a
+    // slower dog ahead of it. follow_gain<=0 disables. desired 0.72 < nominal V gap 0.86
+    // so it never brakes in same-speed formation; only bites when the dog ahead slows.
+    pnh_.param("follow_gain", follow_gain_, 0.5);
+    pnh_.param("follow_desired", follow_desired_, 0.72);
+    pnh_.param("follow_range", follow_range_, 1.5);
+    double cone_deg; pnh_.param("follow_cone_deg", cone_deg, 60.0);
+    follow_cone_cos_ = std::cos(cone_deg * M_PI / 180.0);
 
     pnh_.param("use_astar", use_astar_, false);
     if (use_astar_ && !coord_->obstacles().empty()) {
@@ -170,7 +181,7 @@ class FleetPublisherNode {
     std::string hpath; pnh_.param<std::string>("log_hist_csv", hpath, "");
     if (!hpath.empty()) {
       hist_csv_.open(hpath.c_str());
-      if (hist_csv_.is_open()) hist_csv_ << "# ADMM residuals; row = t, r_prim[0..P-1], r_dual[0..P-1]\n";
+      if (hist_csv_.is_open()) hist_csv_ << "# ADMM residuals; row = t, r_prim[0..P-1], r_dual[0..P-1], planchg_pos[0..P-1](m), planchg_vel[0..P-1](m/s)\n";
     }
 
     timer_ = nh_.createTimer(ros::Duration(ts_), &FleetPublisherNode::tick, this);
@@ -248,6 +259,32 @@ class FleetPublisherNode {
     return to_mat(path_[i]);
   }
 
+  // #1 leader-aware follower cruise speed. Returns v_ unless a dog ahead of i (within the
+  // travel-direction cone and follow_range) is slower: then ACC law caps i's speed at
+  // v_ahead + gain*(gap - desired) so i decelerates to match rather than driving into it.
+  // In normal formation all dogs cruise at ~v_ and gap>=desired -> returns v_ (no slowdown).
+  double followSpeed(int i, const std::map<int, Eigen::VectorXd>& xnow) {
+    if (follow_gain_ <= 0.0) return v_;
+    const Eigen::Vector2d pi = xnow.at(i).head<2>();
+    Eigen::Vector2d dir = goal_[i] - pi;
+    const double dn = dir.norm();
+    if (dn < 1e-3) return v_;  // at goal: no travel direction to define "ahead"
+    dir /= dn;
+    double v_eff = v_;
+    for (int j : dogs_) {
+      if (j == i) continue;
+      const Eigen::Vector2d d = xnow.at(j).head<2>() - pi;
+      const double dist = d.norm();
+      if (dist < 1e-3 || dist > follow_range_) continue;
+      const double proj = d.dot(dir);
+      if (proj <= 0.0 || proj / dist < follow_cone_cos_) continue;  // not ahead / outside cone
+      const double v_ahead = std::max(0.0, xnow.at(j).segment<2>(2).dot(dir));
+      const double v_allow = v_ahead + follow_gain_ * (dist - follow_desired_);
+      v_eff = std::min(v_eff, std::max(0.0, v_allow));
+    }
+    return v_eff;
+  }
+
   void tick(const ros::TimerEvent&) {
     if (!ready()) { ROS_WARN_THROTTLE(2.0, "[fleet_pub_cpp] waiting for all 3 obs+gt ..."); return; }
     std::map<int, Eigen::VectorXd> xnow;
@@ -258,7 +295,8 @@ class FleetPublisherNode {
       xnow[i] = X0; P0[i] = p0;
     }
     for (int i : dogs_)
-      xdes[i] = admm::build_reference(P0[i], waypoints(i, P0[i]), admm::N, admm::TS, v_, 0.80);
+      xdes[i] = admm::build_reference(P0[i], waypoints(i, P0[i]), admm::N, admm::TS,
+                                      followSpeed(i, xnow), 0.80);
 
     std::map<int, Eigen::VectorXd> xi;
     admm::ADMMCoordinator::Hist hist;
@@ -272,7 +310,9 @@ class FleetPublisherNode {
     if (hist_csv_.is_open()) {
       char b[32]; std::snprintf(b, sizeof(b), "%.4f,", obs_[dogs_[0]].time); hist_csv_ << b;
       for (size_t k = 0; k < hist.r_prim.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_prim[k]); hist_csv_ << b << ","; }
-      for (size_t k = 0; k < hist.r_dual.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_dual[k]); hist_csv_ << b << (k + 1 < hist.r_dual.size() ? "," : ""); }
+      for (size_t k = 0; k < hist.r_dual.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_dual[k]); hist_csv_ << b << ","; }
+      for (size_t k = 0; k < hist.r_pos.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_pos[k]); hist_csv_ << b << ","; }
+      for (size_t k = 0; k < hist.r_vel.size(); ++k) { std::snprintf(b, sizeof(b), "%.6g", hist.r_vel[k]); hist_csv_ << b << (k + 1 < hist.r_vel.size() ? "," : ""); }
       hist_csv_ << "\n"; hist_csv_.flush();
     }
 
@@ -435,6 +475,7 @@ class FleetPublisherNode {
   std::unique_ptr<admm::AStarPlanner> planner_;
   std::vector<admm::ArenaRect> arena_rects_;
   double last_formation_yaw_ = 0.0, r_latch_, latch_margin_, d_safe_;
+  double follow_gain_, follow_desired_, follow_range_, follow_cone_cos_;  // #1 leader-aware brake
   int send_cap_; bool use_astar_, viz_;
   std::map<int, bool> yaw_latched_; std::map<int, double> yaw_latch_val_;
   std::map<int, std::vector<Eigen::Vector2d>> path_;

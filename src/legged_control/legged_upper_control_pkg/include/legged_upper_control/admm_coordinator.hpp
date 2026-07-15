@@ -30,6 +30,7 @@ class ADMMCoordinator {
 public:
     struct Hist {
         std::vector<double> r_prim, r_dual, h2_viol;
+        std::vector<double> r_pos, r_vel;  // max |xi-z| in position (m) / velocity (m/s), per iter
         int edge_fail = 0;
     };
 
@@ -41,7 +42,8 @@ public:
     ADMMCoordinator(int p_iters, double rho, std::vector<int> dogs,
                     std::vector<EdgeKey> edges, const LaplacianFormation* formation,
                     double w_form, std::vector<Obstacle> obstacles,
-                    std::vector<Wall> walls, int hard_through, bool parallel = false);
+                    std::vector<Wall> walls, int hard_through, bool parallel = false,
+                    double robot_margin = 0.30);
 
     // One control cycle. xnow[i] = state4, xdes[i] = (N,4).
     std::pair<std::map<int, Eigen::VectorXd>, Hist> step(
