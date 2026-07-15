@@ -121,6 +121,11 @@ class FleetPublisherNode {
     pnh_.param("follow_range", follow_range_, 1.5);
     double cone_deg; pnh_.param("follow_cone_deg", cone_deg, 60.0);
     follow_cone_cos_ = std::cos(cone_deg * M_PI / 180.0);
+    // ACC cap floor: never brake below this. A PARKED dog ahead would otherwise pin the
+    // cap at ~0 forever (passby deadlock, GB7 leg2: dog3 held 105s at cap 0.01) -- the
+    // floor keeps the reference advancing so the CBF slides the dog around laterally,
+    // while still shedding 75% of the approach speed (brake semantics preserved).
+    pnh_.param("follow_floor", follow_floor_, 0.05);
 
     pnh_.param("use_astar", use_astar_, false);
     pnh_.param("astar_robot_radius", r_astar_, 0.35);
@@ -230,7 +235,7 @@ class FleetPublisherNode {
     }
     slots_ = admm::centroid_slot_targets(goal_c, *offsets, yaw);
     assign_ = admm::min_cost_assignment(pos, slots_);
-    have_slots_ = true; stall_since_ = ros::Time(0); cooldown_until_ = ros::Time(0);
+    have_slots_ = true; stall_since_d_.clear(); cooldown_until_ = ros::Time(0);
     for (size_t k = 0; k < dogs_.size(); ++k) {
       goal_[dogs_[k]] = slots_[assign_[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
     }
@@ -261,11 +266,10 @@ class FleetPublisherNode {
   }
 
   Eigen::MatrixX2d waypoints(int i, const Eigen::Vector2d& P0i) {
+    if (path_.find(i) != path_.end()) return to_mat(path_[i]);
     if (!planner_) return to_mat({P0i, goal_[i]});
-    if (path_.find(i) == path_.end()) {
-      auto rg = planner_->find_reachable_goal(P0i, goal_[i]);
-      path_[i] = rg.path.empty() ? std::vector<Eigen::Vector2d>{P0i, goal_[i]} : rg.path;
-    }
+    auto rg = planner_->find_reachable_goal(P0i, goal_[i]);
+    path_[i] = rg.path.empty() ? std::vector<Eigen::Vector2d>{P0i, goal_[i]} : rg.path;
     return to_mat(path_[i]);
   }
 
@@ -276,7 +280,24 @@ class FleetPublisherNode {
   double followSpeed(int i, const std::map<int, Eigen::VectorXd>& xnow) {
     if (follow_gain_ <= 0.0) return v_;
     const Eigen::Vector2d pi = xnow.at(i).head<2>();
-    Eigen::Vector2d dir = goal_[i] - pi;
+    // travel direction = next reference waypoint when a path exists (an A* route or a
+    // rescue detour bends away from the straight goal bearing; aiming the ACC cone at
+    // the goal would brake for a teammate the path actually curves AROUND).
+    Eigen::Vector2d tgt = goal_[i];
+    const auto it = path_.find(i);
+    if (it != path_.end() && it->second.size() >= 2) {
+      // project onto the path first (nearest vertex), THEN look ahead from there --
+      // scanning from the path start would aim the cone BACKWARD once the dog has
+      // passed the first 0.3m, mutually braking any close pair (GB5 crawl bug).
+      size_t k0 = 0; double dbest = 1e18;
+      for (size_t k = 0; k < it->second.size(); ++k) {
+        const double d = (it->second[k] - pi).norm();
+        if (d < dbest) { dbest = d; k0 = k; }
+      }
+      for (size_t k = k0; k < it->second.size(); ++k)
+        if ((it->second[k] - pi).norm() > 0.3) { tgt = it->second[k]; break; }
+    }
+    Eigen::Vector2d dir = tgt - pi;
     const double dn = dir.norm();
     if (dn < 1e-3) return v_;  // at goal: no travel direction to define "ahead"
     dir /= dn;
@@ -290,24 +311,30 @@ class FleetPublisherNode {
       if (proj <= 0.0 || proj / dist < follow_cone_cos_) continue;  // not ahead / outside cone
       const double v_ahead = std::max(0.0, xnow.at(j).segment<2>(2).dot(dir));
       const double v_allow = v_ahead + follow_gain_ * (dist - follow_desired_);
-      v_eff = std::min(v_eff, std::max(0.0, v_allow));
+      v_eff = std::min(v_eff, std::max(v_allow, follow_floor_));
     }
     return v_eff;
   }
 
-  // Settle-short deadlock detector (fingerprint validated on FP4 real-slot data):
-  // fleet stationary >= rescue_stall_s while some dog is > rescue_slot_err off its slot.
+  // Settle-short deadlock detector. PER-DOG stall: dog i is stuck when it sits still
+  // while > rescue_slot_err off its slot -- other dogs may well still be moving (a wedge
+  // mid-transit stalls one dog at a time; the original fleet-wide stillness condition
+  // detected the parked-fleet case but fired ~40s late on wedges, GB3 evidence).
   // Detector always logs; actions run only when ~rescue is true.
   void rescueTick(const std::map<int, Eigen::VectorXd>& xnow, const ros::Time& now) {
     if (!have_slots_) return;
-    bool still = true; double emax = 0.0;
+    int cand = -1; double cerr = -1.0;
     for (int i : dogs_) {
-      still = still && xnow.at(i).segment<2>(2).norm() < rescue_v_eps_;
-      emax = std::max(emax, (xnow.at(i).head<2>() - goal_[i]).norm());
+      const double e = (xnow.at(i).head<2>() - goal_[i]).norm();
+      const bool stuck = xnow.at(i).segment<2>(2).norm() < rescue_v_eps_ && e > rescue_slot_err_;
+      if (!stuck) { stall_since_d_[i] = ros::Time(0); continue; }
+      if (stall_since_d_[i].isZero()) { stall_since_d_[i] = now; continue; }
+      // per-dog rescue cooldown: a freshly-detoured dog steps aside so the OTHER half of
+      // a wedged pair gets routed too (GD leg7: worst-dog monopoly starved its partner)
+      if (now < rescued_until_[i]) continue;
+      if ((now - stall_since_d_[i]).toSec() >= rescue_stall_s_ && e > cerr) { cerr = e; cand = i; }
     }
-    if (!still || emax <= rescue_slot_err_) { stall_since_ = ros::Time(0); return; }
-    if (stall_since_.isZero()) { stall_since_ = now; return; }
-    if ((now - stall_since_).toSec() < rescue_stall_s_ || now < cooldown_until_) return;
+    if (cand < 0 || now < cooldown_until_) return;
     std::string errs;
     for (int i : dogs_) {
       char b[16]; std::snprintf(b, sizeof(b), "%.2f", (xnow.at(i).head<2>() - goal_[i]).norm());
@@ -315,9 +342,64 @@ class FleetPublisherNode {
     }
     ROS_WARN("[rescue] FIRE errs=%s", errs.c_str());
     cooldown_until_ = now + ros::Duration(rescue_cooldown_s_);
-    stall_since_ = ros::Time(0);
+    stall_since_d_.clear();
     if (!rescue_) return;
-    // stage-1 / stage-2 actions: Tasks 3-4
+    // stage-1: re-match dogs->slots from CURRENT positions. Assignment was computed at
+    // goal issuance from a transient formation; re-matching from the parked state gives a
+    // cheap discrete escape when the deadlock is an assignment artifact. Hysteresis: only
+    // accept a strictly better matching so symmetric ties never thrash.
+    std::vector<Eigen::Vector2d> pos;
+    for (int i : dogs_) pos.push_back(xnow.at(i).head<2>());
+    const std::vector<int> a_new = admm::min_cost_assignment(pos, slots_);
+    double c_old = 0.0, c_new = 0.0;
+    for (size_t k = 0; k < dogs_.size(); ++k) {
+      c_old += (pos[k] - slots_[assign_[k]]).norm();
+      c_new += (pos[k] - slots_[a_new[k]]).norm();
+    }
+    if (a_new != assign_ && c_new < c_old - rescue_hyst_) {
+      assign_ = a_new;
+      for (size_t k = 0; k < dogs_.size(); ++k) {
+        goal_[dogs_[k]] = slots_[assign_[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
+      }
+      ROS_WARN("[rescue] stage-1 reassign (cost %.2f -> %.2f)", c_old, c_new);
+      return;
+    }
+    // stage-2: symmetric deadlock (re-matching is a no-op) -> break symmetry by giving the
+    // WORST dog a reference that routes AROUND its parked teammates (BVC-style detour).
+    // Teammate disc D_MIN - r_astar keeps the A* centreline >= D_MIN from a parked dog.
+    // No path even after a start nudge = genuinely fenced out -> hold and log (retrying
+    // is free after the cooldown; the fleet may have shifted by then).
+    const int worst = cand;  // the stalled dog with the largest slot error
+    const double mate_r = std::max(0.30, admm::D_MIN - r_astar_);
+    std::vector<admm::AStarCircle> circles;
+    for (const auto& o : coord_->obstacles())
+      circles.push_back({o.pos[0], o.pos[1], o.radius});
+    Eigen::Vector2d pw = xnow.at(worst).head<2>(), nearest_mate = pw;
+    double dmin_mate = 1e9;
+    for (int j : dogs_) {
+      if (j == worst) continue;
+      const Eigen::Vector2d pj = xnow.at(j).head<2>();
+      circles.push_back({pj[0], pj[1], mate_r});
+      const double d = (pj - pw).norm();
+      if (d < dmin_mate) { dmin_mate = d; nearest_mate = pj; }
+    }
+    std::vector<admm::AStarRect> rects;
+    for (const auto& r : arena_rects_)
+      rects.push_back({r.center[0], r.center[1], r.size[0], r.size[1], r_astar_});
+    const admm::AStarPlanner local(astar_res_, r_astar_, circles, ax_min_, ax_max_,
+                                   ay_min_, ay_max_, /*boundary_margin=*/0.45, rects);
+    std::vector<Eigen::Vector2d> p = local.plan(pw, goal_[worst]);
+    if (p.empty() && dmin_mate < 1e9) {
+      // start cell may sit inside a teammate's inflated disc -> nudge start outward
+      const Eigen::Vector2d away = (pw - nearest_mate).normalized();
+      const Eigen::Vector2d s2 = nearest_mate + away * (mate_r + r_astar_ + astar_res_);
+      p = local.plan(s2, goal_[worst]);
+      if (!p.empty()) p.insert(p.begin(), pw);
+    }
+    if (p.empty()) { ROS_WARN("[rescue] fenced out dog%d (no path)", worst); return; }
+    path_[worst] = p; yaw_latched_[worst] = false;
+    rescued_until_[worst] = now + ros::Duration(2.0 * rescue_cooldown_s_);
+    ROS_WARN("[rescue] stage-2 detour dog%d wp=%zu", worst, p.size());
   }
 
   void tick(const ros::TimerEvent&) {
@@ -513,13 +595,14 @@ class FleetPublisherNode {
   std::unique_ptr<admm::AStarPlanner> planner_;
   std::vector<admm::ArenaRect> arena_rects_;
   double last_formation_yaw_ = 0.0, r_latch_, latch_margin_, d_safe_;
-  double follow_gain_, follow_desired_, follow_range_, follow_cone_cos_;  // #1 leader-aware brake
+  double follow_gain_, follow_desired_, follow_range_, follow_cone_cos_, follow_floor_;  // #1 leader-aware brake
   bool rescue_{true}, have_slots_{false};
   double rescue_stall_s_, rescue_v_eps_, rescue_slot_err_, rescue_hyst_, rescue_cooldown_s_;
   double r_astar_, astar_res_, ax_min_, ax_max_, ay_min_, ay_max_;
   std::vector<Eigen::Vector2d> slots_;
   std::vector<int> assign_;
-  ros::Time stall_since_{0}, cooldown_until_{0};
+  std::map<int, ros::Time> stall_since_d_, rescued_until_;
+  ros::Time cooldown_until_{0};
   int send_cap_; bool use_astar_, viz_;
   std::map<int, bool> yaw_latched_; std::map<int, double> yaw_latch_val_;
   std::map<int, std::vector<Eigen::Vector2d>> path_;
