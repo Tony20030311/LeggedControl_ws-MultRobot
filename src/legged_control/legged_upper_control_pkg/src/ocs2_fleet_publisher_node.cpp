@@ -123,23 +123,31 @@ class FleetPublisherNode {
     follow_cone_cos_ = std::cos(cone_deg * M_PI / 180.0);
 
     pnh_.param("use_astar", use_astar_, false);
+    pnh_.param("astar_robot_radius", r_astar_, 0.35);
+    pnh_.param("astar_res", astar_res_, 0.15);
+    pnh_.param("astar_x_min", ax_min_, 0.0);
+    pnh_.param("astar_x_max", ax_max_, 10.0);
+    pnh_.param("astar_y_min", ay_min_, -5.0);
+    pnh_.param("astar_y_max", ay_max_, 5.0);
     if (use_astar_ && !coord_->obstacles().empty()) {
-      double r_astar, res, x_min, x_max, y_min, y_max;
-      pnh_.param("astar_robot_radius", r_astar, 0.35);
-      pnh_.param("astar_res", res, 0.15);
-      pnh_.param("astar_x_min", x_min, 0.0);
-      pnh_.param("astar_x_max", x_max, 10.0);
-      pnh_.param("astar_y_min", y_min, -5.0);
-      pnh_.param("astar_y_max", y_max, 5.0);
       std::vector<admm::AStarCircle> circles;
       for (const auto& o : coord_->obstacles())
         circles.push_back({o.pos[0], o.pos[1], o.radius});
       std::vector<admm::AStarRect> rects;
       for (const auto& r : arena_rects_)
-        rects.push_back({r.center[0], r.center[1], r.size[0], r.size[1], r_astar});
-      planner_.reset(new admm::AStarPlanner(res, r_astar, circles, x_min, x_max, y_min, y_max,
-                                            /*boundary_margin=*/0.45, rects));
+        rects.push_back({r.center[0], r.center[1], r.size[0], r.size[1], r_astar_});
+      planner_.reset(new admm::AStarPlanner(astar_res_, r_astar_, circles, ax_min_, ax_max_,
+                                            ay_min_, ay_max_, /*boundary_margin=*/0.45, rects));
     }
+
+    // settle-short rescue (detect + reassign + detour). Detector always logs; actions
+    // gated by ~rescue. Fingerprint Gazebo-validated 2026-07-15: 3 true / 0 false fires.
+    pnh_.param("rescue", rescue_, true);
+    pnh_.param("rescue_stall_s", rescue_stall_s_, 8.0);
+    pnh_.param("rescue_v_eps", rescue_v_eps_, 0.02);
+    pnh_.param("rescue_slot_err", rescue_slot_err_, 0.5);
+    pnh_.param("rescue_hyst", rescue_hyst_, 0.05);
+    pnh_.param("rescue_cooldown_s", rescue_cooldown_s_, 10.0);
 
     for (int i : dogs_) {
       std::string ns = "dog" + std::to_string(i);
@@ -200,6 +208,7 @@ class FleetPublisherNode {
     goal_[i] = Eigen::Vector2d(m->pose.position.x, m->pose.position.y);
     path_.erase(i); yaw_latched_[i] = false;
     ROS_INFO("[fleet_pub_cpp] dog%d new goal (%.2f,%.2f)", i, goal_[i][0], goal_[i][1]);
+    have_slots_ = false;  // per-dog mode: no slots, rescue disarmed
   }
 
   void formationGoalCb(const geometry_msgs::PoseStamped::ConstPtr& m) {
@@ -219,10 +228,11 @@ class FleetPublisherNode {
     if (offsets == nullptr || offsets->size() != dogs_.size()) {
       ROS_WARN("[fleet_pub_cpp] /formation/goal ignored: no formation offsets"); return;
     }
-    std::vector<Eigen::Vector2d> slots = admm::centroid_slot_targets(goal_c, *offsets, yaw);
-    std::vector<int> assign = admm::min_cost_assignment(pos, slots);
+    slots_ = admm::centroid_slot_targets(goal_c, *offsets, yaw);
+    assign_ = admm::min_cost_assignment(pos, slots_);
+    have_slots_ = true; stall_since_ = ros::Time(0); cooldown_until_ = ros::Time(0);
     for (size_t k = 0; k < dogs_.size(); ++k) {
-      goal_[dogs_[k]] = slots[assign[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
+      goal_[dogs_[k]] = slots_[assign_[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
     }
     ROS_INFO("[fleet_pub_cpp] /formation/goal centroid (%.2f,%.2f) yaw=%.2f", goal_c[0], goal_c[1], yaw);
   }
@@ -285,6 +295,31 @@ class FleetPublisherNode {
     return v_eff;
   }
 
+  // Settle-short deadlock detector (fingerprint validated on FP4 real-slot data):
+  // fleet stationary >= rescue_stall_s while some dog is > rescue_slot_err off its slot.
+  // Detector always logs; actions run only when ~rescue is true.
+  void rescueTick(const std::map<int, Eigen::VectorXd>& xnow, const ros::Time& now) {
+    if (!have_slots_) return;
+    bool still = true; double emax = 0.0;
+    for (int i : dogs_) {
+      still = still && xnow.at(i).segment<2>(2).norm() < rescue_v_eps_;
+      emax = std::max(emax, (xnow.at(i).head<2>() - goal_[i]).norm());
+    }
+    if (!still || emax <= rescue_slot_err_) { stall_since_ = ros::Time(0); return; }
+    if (stall_since_.isZero()) { stall_since_ = now; return; }
+    if ((now - stall_since_).toSec() < rescue_stall_s_ || now < cooldown_until_) return;
+    std::string errs;
+    for (int i : dogs_) {
+      char b[16]; std::snprintf(b, sizeof(b), "%.2f", (xnow.at(i).head<2>() - goal_[i]).norm());
+      errs += std::string(b) + (i == dogs_.back() ? "" : ",");
+    }
+    ROS_WARN("[rescue] FIRE errs=%s", errs.c_str());
+    cooldown_until_ = now + ros::Duration(rescue_cooldown_s_);
+    stall_since_ = ros::Time(0);
+    if (!rescue_) return;
+    // stage-1 / stage-2 actions: Tasks 3-4
+  }
+
   void tick(const ros::TimerEvent&) {
     if (!ready()) { ROS_WARN_THROTTLE(2.0, "[fleet_pub_cpp] waiting for all 3 obs+gt ..."); return; }
     std::map<int, Eigen::VectorXd> xnow;
@@ -294,6 +329,7 @@ class FleetPublisherNode {
       Eigen::Vector4d X0; Eigen::Vector2d p0; x0(i, X0, p0);
       xnow[i] = X0; P0[i] = p0;
     }
+    rescueTick(xnow, ros::Time::now());
     for (int i : dogs_)
       xdes[i] = admm::build_reference(P0[i], waypoints(i, P0[i]), admm::N, admm::TS,
                                       followSpeed(i, xnow), 0.80);
@@ -353,7 +389,9 @@ class FleetPublisherNode {
                 (double)s[BASE_PX], (double)s[BASE_PY], dx, dy,
                 (double)s[MOM_LIN_X], (double)s[MOM_LIN_Y], xnow[i][2], xnow[i][3],
                 states(0, BASE_PX), states(0, BASE_PY), (double)s[BASE_YAW],
-                states(0, BASE_YAW), (double)k_send};
+                states(0, BASE_YAW), (double)k_send,
+                // world-frame assigned slot: makes per-dog arrival auditable offline
+                goal_[i][0], goal_[i][1]};
     }
     logCsv(dbg);
   }
@@ -476,6 +514,12 @@ class FleetPublisherNode {
   std::vector<admm::ArenaRect> arena_rects_;
   double last_formation_yaw_ = 0.0, r_latch_, latch_margin_, d_safe_;
   double follow_gain_, follow_desired_, follow_range_, follow_cone_cos_;  // #1 leader-aware brake
+  bool rescue_{true}, have_slots_{false};
+  double rescue_stall_s_, rescue_v_eps_, rescue_slot_err_, rescue_hyst_, rescue_cooldown_s_;
+  double r_astar_, astar_res_, ax_min_, ax_max_, ay_min_, ay_max_;
+  std::vector<Eigen::Vector2d> slots_;
+  std::vector<int> assign_;
+  ros::Time stall_since_{0}, cooldown_until_{0};
   int send_cap_; bool use_astar_, viz_;
   std::map<int, bool> yaw_latched_; std::map<int, double> yaw_latch_val_;
   std::map<int, std::vector<Eigen::Vector2d>> path_;
@@ -491,7 +535,7 @@ class FleetPublisherNode {
 
 const std::vector<std::string> FleetPublisherNode::kDbgCols = {
     "gt_x", "gt_y", "estpx", "estpy", "dx", "dy", "obsvx", "obsvy",
-    "x0vx", "x0vy", "tgt1x", "tgt1y", "seed", "cmd", "ksend"};
+    "x0vx", "x0vy", "tgt1x", "tgt1y", "seed", "cmd", "ksend", "slotx", "sloty"};
 
 int main(int argc, char** argv) {
   ros::init(argc, argv, "ocs2_fleet_publisher");
