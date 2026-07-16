@@ -13,7 +13,10 @@
 <launch>
   <!-- empty = auto-match scene launch; arena:=door to override -->
   <arg name="arena"        default=""/>
-  <arg name="v"            default="0.2"/>
+  <!-- 0.25 = v-sweep optimum (2026-07-16): fastest clean profile AND best safety floor
+       (plum min_pair 0.602, zero sub-D_MIN exposure); 0.30 saturates (realized ~0.29)
+       and erodes margins; 0.20 is slower with no margin benefit. -->
+  <arg name="v"            default="0.25"/>
   <arg name="astar_radius" default="0.35"/>
   <arg name="robot_margin" default="0.30"/>  <!-- obstacle CBF: r_eff = radius + this -->
 
