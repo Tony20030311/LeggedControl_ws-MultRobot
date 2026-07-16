@@ -148,7 +148,7 @@ class FleetPublisherNode {
     // settle-short rescue (detect + reassign + detour). Detector always logs; actions
     // gated by ~rescue. Fingerprint Gazebo-validated 2026-07-15: 3 true / 0 false fires.
     pnh_.param("rescue", rescue_, true);
-    pnh_.param("rescue_stall_s", rescue_stall_s_, 8.0);
+    pnh_.param("rescue_stall_s", rescue_stall_s_, 5.0);
     pnh_.param("rescue_v_eps", rescue_v_eps_, 0.02);
     pnh_.param("rescue_slot_err", rescue_slot_err_, 0.5);
     pnh_.param("rescue_hyst", rescue_hyst_, 0.05);
