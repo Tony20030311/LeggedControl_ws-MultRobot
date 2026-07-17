@@ -184,6 +184,15 @@ ADMMCoordinator::step(const std::map<int, Eigen::VectorXd>& xnow,
                 *xnow_p[idx], *xdes_p[idx], xibar_p[idx], &cts[idx], fg_p[idx]);
             *xi_p[idx] = r.xi.head(nz);
         }
+        // A non-finite node solve means that node's QP was infeasible (OSQP -> NaN
+        // xi). Stop the loop NOW, before the edge solve and dual update turn that NaN
+        // into a NaN q that poisons the OSQP workspaces (and before the poisoned
+        // solves spin to max_iter). xi stays non-finite -> the finite-guard at the
+        // end of step() resets the workspaces and cold-starts next cycle.
+        bool node_nan = false;
+        for (int idx = 0; idx < nd; ++idx)
+            if (!xi_p[idx]->allFinite()) { node_nan = true; break; }
+        if (node_nan) break;
         // edge update (parallel over edges)
 #pragma omp parallel for schedule(static) reduction(+ : edge_fail_round) if (parallel_)
         for (int idx = 0; idx < ne; ++idx) {
