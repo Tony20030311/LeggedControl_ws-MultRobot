@@ -229,12 +229,24 @@ ADMMCoordinator::step(const std::map<int, Eigen::VectorXd>& xnow,
         z_prev = z;
     }
 
-    // 4. store for next-cycle warm start
-    prev_xi_ = xi;
-    prev_z_ = z;
-    prev_lam_ = lam;
-    has_prev_ = true;
-    cycle_ += 1;
+    // 4. store for next-cycle warm start -- NEVER store a non-finite iterate. One
+    // infeasible node solve returns NaN xi, the dual update writes NaN into lam, and
+    // a stored NaN warm start reproduces itself every cycle after (PF2 2026-07-16:
+    // a single NaN at t=330 froze the fleet for the remaining 1264 s, 7 legs lost).
+    // Dropping the warm start costs one cold-start cycle -- the cycle_==0 path.
+    bool finite = true;
+    for (const int i : dogs_)
+        if (!xi.at(i).allFinite()) { finite = false; break; }
+    if (finite) {
+        prev_xi_ = xi;
+        prev_z_ = z;
+        prev_lam_ = lam;
+        has_prev_ = true;
+        cycle_ += 1;
+    } else {
+        has_prev_ = false;
+        cycle_ = 0;
+    }
     return {xi, hist};
 }
 

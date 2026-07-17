@@ -1,15 +1,4 @@
 <?xml version="1.0"?>
-<!-- Bundles the manual demo steps 4+5+6: kill the C++ target nodes, start the ADMM
-     fleet publisher (plum, radius 0.35, yaw cap, init goals = home so the dogs hold),
-     and open RViz showing the per-dog ADMM ROLLOUT + slot goals + peg circles.
-     Run AFTER: three_dogs_plum.launch -> fleet_bringup.launch -> start_fleet.sh trot.
-     Then command the fleet with ONE centroid point:
-       rostopic pub -1 /formation/goal geometry_msgs/PoseStamped \
-         "{header: {frame_id: 'world'}, pose: {position: {x: 9.0, y: 0.0, z: 0.5}}}"
-     DOOR demo (three_dogs_door.launch): use the legacy-aligned inflation, Gazebo-proven
-     (15-round + fuzz campaigns 2026-07-15) -- the defaults leave door pockets infeasible:
-       roslaunch legged_upper_control admm_demo.launch arena:=door \
-         robot_margin:=0.20 astar_radius:=0.20 -->
 <launch>
   <!-- empty = auto-match scene launch; arena:=door to override -->
   <arg name="arena"        default=""/>

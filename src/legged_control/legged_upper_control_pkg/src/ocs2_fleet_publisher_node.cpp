@@ -235,7 +235,10 @@ class FleetPublisherNode {
     }
     slots_ = admm::centroid_slot_targets(goal_c, *offsets, yaw);
     assign_ = admm::min_cost_assignment(pos, slots_);
+    // a new goal is a clean slate for the rescue state: rescued_until_ too, else a per-dog
+    // lockout earned under the PREVIOUS goal silently skips this dog for up to 2*cooldown.
     have_slots_ = true; stall_since_d_.clear(); cooldown_until_ = ros::Time(0);
+    rescued_until_.clear();
     for (size_t k = 0; k < dogs_.size(); ++k) {
       goal_[dogs_[k]] = slots_[assign_[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
     }
@@ -351,16 +354,26 @@ class FleetPublisherNode {
     std::vector<Eigen::Vector2d> pos;
     for (int i : dogs_) pos.push_back(xnow.at(i).head<2>());
     const std::vector<int> a_new = admm::min_cost_assignment(pos, slots_);
+    // score with the SAME metric min_cost_assignment minimises (sum of SQUARED distances,
+    // fleet_config.cpp:117). Scoring its squared-optimal result by unsquared .norm() rejects
+    // valid escapes: {2.00,0.10} sq 4.01 / sum 2.10 vs {1.40,1.40} sq 3.92 / sum 2.80 --
+    // the solver picks the latter, an unsquared gate then vetoes it. rescue_hyst_ is now a
+    // squared-distance margin (kept at its proven 0.05; it only has to break exact ties).
     double c_old = 0.0, c_new = 0.0;
     for (size_t k = 0; k < dogs_.size(); ++k) {
-      c_old += (pos[k] - slots_[assign_[k]]).norm();
-      c_new += (pos[k] - slots_[a_new[k]]).norm();
+      c_old += (pos[k] - slots_[assign_[k]]).squaredNorm();
+      c_new += (pos[k] - slots_[a_new[k]]).squaredNorm();
     }
     if (a_new != assign_ && c_new < c_old - rescue_hyst_) {
-      assign_ = a_new;
       for (size_t k = 0; k < dogs_.size(); ++k) {
-        goal_[dogs_[k]] = slots_[assign_[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
+        // ONLY touch dogs whose slot actually changed. Unlatching a dog parked ON its
+        // goal re-arms the yaw-runaway the goal-proximity latch exists to prevent
+        // (DF1 forensics 2026-07-16: dog1<->dog2 swap unlatched the UNINVOLVED dog3,
+        // parked 0.06m from goal -> 0.57 m/s runaway -> QP infeasible -> HOLD storm).
+        if (a_new[k] == assign_[k]) continue;
+        goal_[dogs_[k]] = slots_[a_new[k]]; path_.erase(dogs_[k]); yaw_latched_[dogs_[k]] = false;
       }
+      assign_ = a_new;
       ROS_WARN("[rescue] stage-1 reassign (cost %.2f -> %.2f)", c_old, c_new);
       return;
     }
@@ -388,6 +401,11 @@ class FleetPublisherNode {
       rects.push_back({r.center[0], r.center[1], r.size[0], r.size[1], r_astar_});
     const admm::AStarPlanner local(astar_res_, r_astar_, circles, ax_min_, ax_max_,
                                    ay_min_, ay_max_, /*boundary_margin=*/0.45, rects);
+    // plan(), NOT find_reachable_goal: hard-fail -> "fenced out" wait is the PROVEN
+    // behavior. Relocation sounds nicer but degenerates when the slot cell rounds into
+    // the boundary band (PF2 2026-07-16: every candidate collapsed to the dog's own
+    // cell, wp 5->2->1, dragging the dog AWAY from a slot it was 0.7 m from). A fenced
+    // dog just holds; retry is free after the cooldown once the fleet has shifted.
     std::vector<Eigen::Vector2d> p = local.plan(pw, goal_[worst]);
     if (p.empty() && dmin_mate < 1e9) {
       // start cell may sit inside a teammate's inflated disc -> nudge start outward
@@ -412,9 +430,15 @@ class FleetPublisherNode {
       xnow[i] = X0; P0[i] = p0;
     }
     rescueTick(xnow, ros::Time::now());
-    for (int i : dogs_)
-      xdes[i] = admm::build_reference(P0[i], waypoints(i, P0[i]), admm::N, admm::TS,
+    for (int i : dogs_) {
+      // waypoints() WRITES path_, followSpeed() READS it to pick the travel direction.
+      // As two arguments of one call their order is unspecified -- on the tick after any
+      // path_.erase(i) followSpeed could run first, miss the cache and aim the ACC cone
+      // down the straight goal bearing. Sequence them explicitly.
+      const Eigen::MatrixX2d wp = waypoints(i, P0[i]);
+      xdes[i] = admm::build_reference(P0[i], wp, admm::N, admm::TS,
                                       followSpeed(i, xnow), 0.80);
+    }
 
     std::map<int, Eigen::VectorXd> xi;
     admm::ADMMCoordinator::Hist hist;
@@ -511,6 +535,17 @@ class FleetPublisherNode {
         pts.emplace_back(o.pos[0] + o.radius * std::cos(a), o.pos[1] + o.radius * std::sin(a), 0.05);
       }
       arr.markers.push_back(lineMarker("obstacles", j++, pts, 0.55, 0.55, 0.55, 0.03));
+    }
+    int w = 0;  // walls: rect obstacle outlines (door arena walls/posts frames)
+    for (const auto& r : arena_rects_) {
+      const double hx = r.size[0] / 2.0, hy = r.size[1] / 2.0;
+      std::vector<Eigen::Vector3d> pts;
+      pts.emplace_back(r.center[0] - hx, r.center[1] - hy, 0.05);
+      pts.emplace_back(r.center[0] + hx, r.center[1] - hy, 0.05);
+      pts.emplace_back(r.center[0] + hx, r.center[1] + hy, 0.05);
+      pts.emplace_back(r.center[0] - hx, r.center[1] + hy, 0.05);
+      pts.emplace_back(r.center[0] - hx, r.center[1] - hy, 0.05);
+      arr.markers.push_back(lineMarker("walls", w++, pts, 0.85, 0.85, 0.85, 0.05));
     }
     static const std::map<int, Eigen::Vector3d> rgb = {
         {1, {0.90, 0.20, 0.20}}, {2, {0.20, 0.80, 0.30}}, {3, {0.20, 0.45, 0.95}}};

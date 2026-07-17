@@ -21,6 +21,10 @@ Eigen::VectorXd cumulative_arclength(const Eigen::MatrixX2d& wp) {
 
 Eigen::Vector2d point_at_arclength(const Eigen::MatrixX2d& wp,
                                    const Eigen::VectorXd& cum, double s) {
+    // Single-point path: no segment to interpolate -- pin on the point. Without this
+    // the index clamp below lands on row -1 (out-of-bounds read, UB) whenever a
+    // degenerate 1-waypoint path reaches build_reference (seen via rescue, PF2).
+    if (wp.rows() < 2) return Eigen::Vector2d(wp(0, 0), wp(0, 1));
     const double L = cum(cum.size() - 1);
     s = std::min(std::max(s, 0.0), L);
     // np.searchsorted(cum, s, side="right") - 1
