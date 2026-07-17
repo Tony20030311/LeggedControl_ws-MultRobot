@@ -244,6 +244,14 @@ ADMMCoordinator::step(const std::map<int, Eigen::VectorXd>& xnow,
         has_prev_ = true;
         cycle_ += 1;
     } else {
+        // Dropping the coordinator warm start is NOT enough on its own: a NaN q
+        // (via the NaN dual) poisons each OSQP workspace's internal warm-start
+        // iterate, and warm_start=1 keeps that NaN forever -- the cold-start
+        // uncoupled_() next cycle solves the SAME poisoned workspaces and returns
+        // NaN again (verified: a poisoned edge stays NaN on every later finite
+        // solve). Tear every workspace down so the cycle_==0 rebuild is truly clean.
+        for (const int i : dogs_) node_[i]->reset_solver();
+        for (const EdgeKey& e : edges_) edge_[e]->reset_solver();
         has_prev_ = false;
         cycle_ = 0;
     }

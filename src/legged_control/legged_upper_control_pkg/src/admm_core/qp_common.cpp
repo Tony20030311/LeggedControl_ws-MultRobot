@@ -79,6 +79,13 @@ OsqpProblem::~OsqpProblem() {
     if (work_) osqp_cleanup(work_);
 }
 
+void OsqpProblem::reset() {
+    if (work_) {
+        osqp_cleanup(work_);
+        work_ = nullptr;  // is_setup() -> false, next solve() re-runs setup()
+    }
+}
+
 void OsqpProblem::setup(const CscPattern& P, const std::vector<double>& Px,
                         const std::vector<double>& q, const CscPattern& A,
                         const std::vector<double>& Ax, std::vector<double> l,

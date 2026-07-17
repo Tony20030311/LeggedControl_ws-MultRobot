@@ -348,6 +348,7 @@ PYBIND11_MODULE(admm_core_cpp, m) {
                  return py::make_tuple(o.z_i, o.z_j, o.s);
              },
              py::arg("xi_i"), py::arg("xi_j"), py::arg("lam_i"), py::arg("lam_j"))
+        .def("reset_solver", &admm::EdgeSubproblem::reset_solver)
         .def("_debug_P",
              [](const admm::EdgeSubproblem& self) {
                  return py::make_tuple(self.debug_P_pattern().p, self.debug_P_pattern().i,

@@ -55,6 +55,9 @@ public:
 
     int N_;
 
+    // Drop the poisoned OSQP workspace so the next solve() rebuilds it clean.
+    void reset_solver() { prob_.reset(); }
+
     // --- debug accessors for the bit-parity gate (test_cpp_parity.py) ---
     struct PassData {
         std::vector<double> q, Ax, lo, up;

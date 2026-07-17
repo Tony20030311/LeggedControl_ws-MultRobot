@@ -78,6 +78,13 @@ public:
     };
     Result solve();
 
+    // Tear the OSQP workspace down so the next solve() re-runs setup() from
+    // scratch. Needed because warm_start=1 keeps the internal x/y iterate across
+    // solves: once a NaN q poisons that iterate it NEVER clears on later finite
+    // solves (verified: edge stays NaN for every subsequent feasible solve), so a
+    // full rebuild is the only way back to a clean cold start.
+    void reset();
+
 private:
     OSQPWorkspace* work_ = nullptr;
 };

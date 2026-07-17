@@ -32,6 +32,9 @@ public:
 
     int N_;
 
+    // Drop the poisoned OSQP workspace so the next solve() rebuilds it clean.
+    void reset_solver() { prob_.reset(); }
+
     // --- debug accessors for the bit-parity gate ---
     const CscPattern& debug_P_pattern() const { return P_pat_; }
     const std::vector<double>& debug_P_data() const { return P_data_; }
